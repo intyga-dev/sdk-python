@@ -23,80 +23,56 @@ class TestGoldenVectors(unittest.TestCase):
                 result = sakra_sdk.stable_stringify(val)
                 self.assertEqual(result, expected)
 
-    def test_authorization_payloads(self):
-        cases = self.vectors.get("authorizationPayloads", [])
+    def test_intent_payloads(self):
+        # The DIV Intent Payload binds target + requester + expiry and is strict RFC 8785 JCS; it must
+        # stay byte-identical to the committed vectors (which the TS/Go/Rust builders also pin).
+        cases = self.vectors.get("intentPayloads", [])
+        self.assertTrue(cases, "no DIV intent vectors present")
         for i, case in enumerate(cases):
             inp = case["input"]
             expected = case["expected"]
             with self.subTest(index=i):
-                result = sakra_sdk.canonical_authorization_payload(
-                    nonce=inp["nonce"],
+                result = sakra_sdk.canonical_intent_payload(
+                    target=inp["target"],
                     action_type=inp["actionType"],
-                    action_description=inp["actionDescription"],
-                    params=inp["params"]
-                )
-                self.assertEqual(result, expected)
-
-    def test_authorization_payloads_v3(self):
-        # v3 binds the requester; the payload must stay byte-identical to the committed vectors (which
-        # the TS builder also pins), including the literal `null` attestation for an unattested caller.
-        cases = self.vectors.get("authorizationPayloadsV3", [])
-        self.assertTrue(cases, "no v3 authorization vectors present")
-        for i, case in enumerate(cases):
-            inp = case["input"]
-            expected = case["expected"]
-            with self.subTest(index=i):
-                result = sakra_sdk.canonical_authorization_payload_v3(
-                    nonce=inp["nonce"],
-                    action_type=inp["actionType"],
-                    action_description=inp["actionDescription"],
+                    display=inp["actionDescription"],
                     params=inp["params"],
                     requester=inp["requester"],
+                    nonce=inp["nonce"],
+                    expires_at=inp["expiresAt"],
                 )
                 self.assertEqual(result, expected)
 
-    def test_v3_requester_did_assertion(self):
-        # The optional requesterDid assertion mirrors the TS verifier: it must match on v3, and asking
-        # it of a v2 receipt (which binds no requester) must fail rather than silently pass.
+    def test_requester_did_assertion(self):
+        # The optional requesterDid assertion must match the receipt's bound requester.
         receipts = {r["name"]: r["receipt"] for r in self.vectors.get("receipts", [])}
-        v3 = receipts["v3-es256-attested"]
-        v2 = receipts["es256-raw-p1363"]
-        did = v3["requester"]["did"]
-        v3_nonce = json.loads(v3["canonicalPayload"])["nonce"]
-        v2_nonce = json.loads(v2["canonicalPayload"])["nonce"]
+        r = receipts["es256-raw-p1363"]
+        did = r["requester"]["did"]
+        nonce = json.loads(r["canonicalPayload"])["nonce"]
 
         ok = sakra_sdk.verify_approval_receipt(
-            v3,
+            r,
             {
-                "actionType": v3["actionType"],
-                "params": v3["params"],
+                "target": r["target"],
+                "actionType": r["actionType"],
+                "params": r["params"],
                 "requesterDid": did,
-                "nonce": v3_nonce,
+                "nonce": nonce,
             },
         )
         self.assertTrue(ok.get("ok"), ok.get("reason"))
 
         mismatch = sakra_sdk.verify_approval_receipt(
-            v3,
+            r,
             {
-                "actionType": v3["actionType"],
-                "params": v3["params"],
+                "target": r["target"],
+                "actionType": r["actionType"],
+                "params": r["params"],
                 "requesterDid": "did:sakra:someone-else",
-                "nonce": v3_nonce,
+                "nonce": nonce,
             },
         )
         self.assertFalse(mismatch.get("ok"))
-
-        v2_asserted = sakra_sdk.verify_approval_receipt(
-            v2,
-            {
-                "actionType": v2["actionType"],
-                "params": v2["params"],
-                "requesterDid": did,
-                "nonce": v2_nonce,
-            },
-        )
-        self.assertFalse(v2_asserted.get("ok"))
 
     def test_action_payloads(self):
         cases = self.vectors.get("actionPayloads", [])
@@ -169,6 +145,7 @@ class TestGoldenVectors(unittest.TestCase):
                 # redeeming, which is what lets it enforce single-use on its own side. For a golden
                 # vector, that is whatever the signed payload commits to.
                 expected = {
+                    "target": receipt.get("target"),
                     "actionType": receipt.get("actionType"),
                     "params": receipt.get("params"),
                     "nonce": json.loads(receipt["canonicalPayload"])["nonce"],

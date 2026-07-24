@@ -1,0 +1,191 @@
+import asyncio
+import base64
+import json
+import math
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+def _load_stored_token(gateway_url: str) -> Optional[str]:
+    try:
+        creds_path = Path.home() / ".sakra" / "credentials.json"
+        if creds_path.is_file():
+            with open(creds_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get(gateway_url)
+    except Exception:
+        pass
+    return None
+
+def _sync_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
+    headers = headers or {}
+    req = urllib.request.Request(url, method=method, headers=headers)
+    if json_body is not None:
+        req.data = json.dumps(json_body).encode("utf-8")
+        req.add_header("content-type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as response:
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8")
+        except Exception:
+            body = ""
+        return e.code, body
+    except urllib.error.URLError as e:
+        raise Exception(f"Connection failed: {e.reason}")
+
+async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
+    return await asyncio.to_thread(_sync_request, url, method, headers, json_body)
+
+class SakraClient:
+    def __init__(
+        self,
+        gateway_url: str,
+        token: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None
+    ):
+        self._gateway_url = gateway_url.rstrip("/")
+        self._token = token
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._cached_token = None
+
+    async def token(self) -> str:
+        """Resolve a bearer token: the provided one, a cached exchange, or a fresh client-credentials exchange."""
+        if self._token:
+            return self._token
+        if self._cached_token:
+            return self._cached_token
+        stored = _load_stored_token(self._gateway_url)
+        if stored:
+            self._cached_token = stored
+            return stored
+        if not self._client_id or not self._client_secret:
+            raise ValueError("provide `token`, or `client_id` + `client_secret`, or run `sakra login` first")
+        
+        basic = base64.b64encode(f"{self._client_id}:{self._client_secret}".encode("utf-8")).decode("utf-8")
+        status, body = await _async_request(
+            f"{self._gateway_url}/oauth/token",
+            method="POST",
+            headers={"authorization": f"Basic {basic}"}
+        )
+        if status < 200 or status >= 300:
+            raise Exception(f"token exchange failed: {status} {body}")
+        
+        data = json.loads(body)
+        self._cached_token = data["access_token"]
+        return self._cached_token
+
+    async def authorize(
+        self,
+        action_description: str,
+        action_type: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Request action authorization (creates a challenge)."""
+        token_str = await self.token()
+        payload = {
+            "actionDescription": action_description,
+            "actionType": action_type,
+            "params": params if params is not None else {},
+        }
+        if timeout is not None:
+            payload["timeout"] = timeout
+
+        status, body = await _async_request(
+            f"{self._gateway_url}/authorize",
+            method="POST",
+            headers={
+                "authorization": f"Bearer {token_str}",
+                "content-type": "application/json"
+            },
+            json_body=payload
+        )
+        if status < 200 or status >= 300:
+            raise Exception(f"authorize failed: {status} {body}")
+        return json.loads(body)
+
+    async def consume(
+        self,
+        nonce: str,
+        action_type: str,
+        params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Confirm that the approved signature matches the exact instruction and marks it single-use."""
+        token_str = await self.token()
+        payload = {
+            "nonce": nonce,
+            "actionType": action_type,
+            "params": params if params is not None else {}
+        }
+        status, body = await _async_request(
+            f"{self._gateway_url}/authorize/verify",
+            method="POST",
+            headers={
+                "authorization": f"Bearer {token_str}",
+                "content-type": "application/json"
+            },
+            json_body=payload
+        )
+        if status < 200 or status >= 300:
+            raise Exception(f"consume failed: {status} {body}")
+        return json.loads(body)
+
+    async def status(self, nonce: str) -> Dict[str, Any]:
+        """Poll a challenge's current status (non-blocking)."""
+        token_str = await self.token()
+        status, body = await _async_request(
+            f"{self._gateway_url}/authorize/{urllib.parse.quote(nonce)}",
+            method="GET",
+            headers={"authorization": f"Bearer {token_str}"}
+        )
+        if status < 200 or status >= 300:
+            raise Exception(f"status failed: {status} {body}")
+        return json.loads(body)
+
+    async def require_approval(
+        self,
+        action_description: str,
+        action_type: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+        timeout_ms: Optional[int] = None,
+        interval_ms: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Create a challenge and block until approved, denied, or expired."""
+        backend_timeout_sec = math.ceil(timeout_ms / 1000) if timeout_ms is not None else timeout
+        
+        auth_res = await self.authorize(
+            action_description=action_description,
+            action_type=action_type,
+            params=params,
+            timeout=backend_timeout_sec
+        )
+        nonce = auth_res["nonce"]
+
+        deadline = (time.time() * 1000) + (timeout_ms if timeout_ms is not None else 120000)
+        interval_sec = (interval_ms / 1000) if interval_ms is not None else 2.0
+
+        while True:
+            r = await self.status(nonce)
+            if r.get("status") != "PENDING":
+                return r
+            if (time.time() * 1000) > deadline:
+                return {"status": "EXPIRED"}
+            await asyncio.sleep(interval_sec)
+
+    async def verify(self, document_hash: str) -> Dict[str, Any]:
+        """Lookup a signed document witness by hash."""
+        status, body = await _async_request(
+            f"{self._gateway_url}/verify/{urllib.parse.quote(document_hash)}",
+            method="GET"
+        )
+        if status < 200 or status >= 300:
+            raise Exception(f"verify failed: {status} {body}")
+        return json.loads(body)

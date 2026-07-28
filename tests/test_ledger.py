@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-from sakra_sdk import ledger
+from intyga_sdk import ledger
 
 
 class TestLedgerVectors(unittest.TestCase):

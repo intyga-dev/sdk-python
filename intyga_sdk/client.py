@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 
 def _load_stored_token(gateway_url: str) -> Optional[str]:
     try:
-        creds_path = Path.home() / ".sakra" / "credentials.json"
+        creds_path = Path.home() / ".intyga" / "credentials.json"
         if creds_path.is_file():
             with open(creds_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -41,7 +41,7 @@ def _sync_request(url: str, method: str = "GET", headers: Optional[Dict[str, str
 async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
     return await asyncio.to_thread(_sync_request, url, method, headers, json_body)
 
-class SakraClient:
+class IntygaClient:
     def __init__(
         self,
         gateway_url: str,
@@ -66,7 +66,7 @@ class SakraClient:
             self._cached_token = stored
             return stored
         if not self._client_id or not self._client_secret:
-            raise ValueError("provide `token`, or `client_id` + `client_secret`, or run `sakra login` first")
+            raise ValueError("provide `token`, or `client_id` + `client_secret`, or run `intyga login` first")
         
         basic = base64.b64encode(f"{self._client_id}:{self._client_secret}".encode("utf-8")).decode("utf-8")
         status, body = await _async_request(

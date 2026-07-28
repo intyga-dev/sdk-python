@@ -1,6 +1,6 @@
 """DEWP audit-ledger verification (docs/DEWP.md) — Python port.
 
-Byte-identical to the TypeScript reference (`@sakra-trust/verify` ledger-*.ts) and the Go/Rust ports,
+Byte-identical to the TypeScript reference (`@intyga/verify` ledger-*.ts) and the Go/Rust ports,
 locked by the shared cross-language vectors (packages/mcp-schemas/vectors/ledger-vectors.json).
 
 Domain separation: 0x00 leaf, 0x01 node, 0x02 empty root, 0x03 anchor. Node children are HEX-DECODED
@@ -61,13 +61,13 @@ def verify_merkle_proof(leaf: str, proof: List[Dict[str, str]], root: str) -> bo
     return h == root
 
 
-# ── Leaf preimage (DEWP sakra.v1 profile: 18-element array, tenantSeq last) ───────────────────────
+# ── Leaf preimage (DEWP intyga.v1 profile: 18-element array, tenantSeq last) ───────────────────────
 # Order MUST match packages/verify ledger-leaf.ts and the producer. metadata is embedded as a plain
 # JSON string (insertion order, not JCS) exactly like JS `JSON.stringify(metadata ?? null)`.
 def canonical_preimage(row: Dict[str, Any]) -> str:
     metadata = row.get("metadata", None)
     # DEWP §4.2: metadata is a JCS string — keys sorted recursively (sort_keys), so the leaf hash is
-    # insertion-order- and language-independent. Matches @sakra-trust/verify jcsStringify.
+    # insertion-order- and language-independent. Matches @intyga/verify jcsStringify.
     metadata_str = (
         json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         if metadata is not None

@@ -1,5 +1,5 @@
 from . import ledger
-from .client import SakraClient
+from .client import IntygaClient
 from .crypto import (
     stable_stringify,
     canonical_challenge_payload,
@@ -17,7 +17,7 @@ from .crypto import (
 )
 
 __all__ = [
-    "SakraClient",
+    "IntygaClient",
     "stable_stringify",
     "canonical_challenge_payload",
     "canonical_authorization_payload",

@@ -44,6 +44,119 @@ class TestGoldenVectors(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
+    def test_offline_intent_payloads(self):
+        # Offline approval shares the intent payload's canonicalization contract and adds
+        # `challengedAt`. The two kinds must never produce the same bytes: if they did, an out-of-band
+        # approval would be indistinguishable from a gateway-mediated one, and an ordinary approval
+        # could be replayed as an offline one long after the fact.
+        cases = self.vectors.get("offlineIntentPayloads", [])
+        self.assertTrue(cases, "no offline-approval vectors present")
+        for i, case in enumerate(cases):
+            inp = case["input"]
+            with self.subTest(index=i):
+                result = intyga_sdk.canonical_offline_intent_payload(
+                    target=inp["target"],
+                    action_type=inp["actionType"],
+                    display=inp["actionDescription"],
+                    params=inp["params"],
+                    requester=inp["requester"],
+                    requirement=inp["requirement"],
+                    nonce=inp["nonce"],
+                    challenged_at=inp["challengedAt"],
+                    expires_at=inp["expiresAt"],
+                )
+                self.assertEqual(result, case["expected"])
+                self.assertIn('"type":"div-offline-intent"', result)
+
+                # And the kinds must not collide for the same action.
+                intent = intyga_sdk.canonical_intent_payload(
+                    target=inp["target"],
+                    action_type=inp["actionType"],
+                    display=inp["actionDescription"],
+                    params=inp["params"],
+                    requester=inp["requester"],
+                    requirement=inp["requirement"],
+                    nonce=inp["nonce"],
+                    expires_at=inp["expiresAt"],
+                )
+                self.assertNotEqual(result, intent)
+
+    def test_delegation_payloads(self):
+        # A delegation authorizes nothing, so what these pin is that its bytes are distinct from both
+        # other kinds and that `delegatedTo` is canonicalized as a SET. The vector input is
+        # deliberately unsorted, so this is what proves every port sorts it.
+        cases = self.vectors.get("delegationPayloads", [])
+        self.assertTrue(cases, "no delegation vectors present")
+        for i, case in enumerate(cases):
+            inp = case["input"]
+            with self.subTest(index=i):
+                result = intyga_sdk.canonical_delegation_payload(
+                    target=inp["target"],
+                    action_type=inp["actionType"],
+                    display=inp["actionDescription"],
+                    params=inp["params"],
+                    requester=inp["requester"],
+                    requirement=inp["requirement"],
+                    delegated_to=inp["delegatedTo"],
+                    delegated_quorum=inp["delegatedQuorum"],
+                    nonce=inp["nonce"],
+                    sealed_at=inp["sealedAt"],
+                    expires_at=inp["expiresAt"],
+                )
+                self.assertEqual(result, case["expected"])
+                self.assertIn('"type":"div-delegation"', result)
+                self.assertIn(
+                    '"delegatedTo":["did:intyga:sre-a","did:intyga:sre-b","did:intyga:sre-c"]',
+                    result,
+                )
+
+    def test_delegation_is_refused_by_the_approval_verifier(self):
+        # The structural guarantee: a delegation must never be accepted as an approval, and there is no
+        # option that would let one through.
+        case = self.vectors["delegationPayloads"][0]
+        receipt = {
+            "canonicalPayload": case["expected"],
+            "actionDescription": case["input"]["actionDescription"],
+            "params": case["input"]["params"],
+            "requester": case["input"]["requester"],
+            "verificationCode": "0000-0000",
+        }
+        expected = {
+            "target": case["input"]["target"],
+            "actionType": case["input"]["actionType"],
+            "params": case["input"]["params"],
+            "nonce": case["input"]["nonce"],
+            "approvers": {"publicKeys": ["x"]},
+        }
+        for kwargs in (
+            {},
+            {"allow_offline": True},
+            {"allow_offline": True, "allow_auto_approved": True, "allow_expired": True},
+        ):
+            r = intyga_sdk.verify_approval_receipt(receipt, expected, **kwargs)
+            self.assertFalse(r.get("ok"))
+            self.assertIn("authorizes no action on its own", r.get("reason", ""))
+
+    def test_offline_proof_is_refused_without_the_opt_in(self):
+        case = self.vectors["offlineIntentPayloads"][0]
+        receipt = {
+            "canonicalPayload": case["expected"],
+            "actionDescription": case["input"]["actionDescription"],
+            "params": case["input"]["params"],
+            "requester": case["input"]["requester"],
+            "verificationCode": "0000-0000",
+        }
+        expected = {
+            "target": case["input"]["target"],
+            "actionType": case["input"]["actionType"],
+            "params": case["input"]["params"],
+            "nonce": case["input"]["nonce"],
+            "approvers": {"publicKeys": ["x"]},
+        }
+        r = intyga_sdk.verify_approval_receipt(receipt, expected)
+        self.assertFalse(r.get("ok"))
+        self.assertIn("allow_offline", r.get("reason", ""))
+
     def test_requester_did_assertion(self):
         # The optional requesterDid assertion must match the receipt's bound requester.
         receipts = {r["name"]: r["receipt"] for r in self.vectors.get("receipts", [])}

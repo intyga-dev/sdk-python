@@ -5,6 +5,8 @@ from .crypto import (
     canonical_challenge_payload,
     canonical_authorization_payload,
     canonical_authorization_payload_v3,
+    canonical_delegation_payload,
+    canonical_offline_intent_payload,
     canonical_intent_payload,
     canonical_action_payload,
     canonical_enroll_payload,
@@ -13,6 +15,7 @@ from .crypto import (
     verification_code,
     verify_ecdsa_p256,
     verify_approval_receipt,
+    verify_delegation,
     PolicyCrypto as policy,
 )
 
@@ -22,6 +25,8 @@ __all__ = [
     "canonical_challenge_payload",
     "canonical_authorization_payload",
     "canonical_authorization_payload_v3",
+    "canonical_delegation_payload",
+    "canonical_offline_intent_payload",
     "canonical_intent_payload",
     "canonical_action_payload",
     "canonical_enroll_payload",
@@ -30,6 +35,7 @@ __all__ = [
     "verification_code",
     "verify_ecdsa_p256",
     "verify_approval_receipt",
+    "verify_delegation",
     "policy",
     "ledger",
 ]

@@ -47,13 +47,38 @@ class IntygaClient:
         gateway_url: str,
         token: Optional[str] = None,
         client_id: Optional[str] = None,
-        client_secret: Optional[str] = None
+        client_secret: Optional[str] = None,
+        target: Optional[str] = None,
+        allow_stored_credentials: bool = False,
     ):
+        """
+        `target` names the relying party / execution environment approvals raised through this client
+        are bound to (DIV §3 Invariant 5, Target Isolation). Supply it: when it is absent the gateway
+        falls back to the literal "global", and an approval bound to "global" verifies at every other
+        relying party that also uses "global" — the cross-service replay this invariant exists to
+        prevent. It can be passed per call instead, but not omitted at both.
+
+        `allow_stored_credentials` gates reading `~/.intyga/credentials.json`. It defaults to False
+        and is intended for CLI tools, matching @intyga/sdk. Reading it unconditionally meant a
+        service constructed with no credentials — which should raise — silently assumed whatever
+        principal a human's `intyga login` had left in that account's home directory.
+        """
         self._gateway_url = gateway_url.rstrip("/")
         self._token = token
         self._client_id = client_id
         self._client_secret = client_secret
+        self._target = target
+        self._allow_stored_credentials = allow_stored_credentials
         self._cached_token = None
+
+    def _resolve_target(self, target: Optional[str]) -> str:
+        resolved = target if target is not None else self._target
+        if not resolved or not resolved.strip():
+            raise ValueError(
+                "target is required (DIV Target Isolation): name the relying party / execution "
+                "environment this approval is bound to, on the call or on IntygaClient(...)"
+            )
+        return resolved.strip()
 
     async def token(self) -> str:
         """Resolve a bearer token: the provided one, a cached exchange, or a fresh client-credentials exchange."""
@@ -61,10 +86,11 @@ class IntygaClient:
             return self._token
         if self._cached_token:
             return self._cached_token
-        stored = _load_stored_token(self._gateway_url)
-        if stored:
-            self._cached_token = stored
-            return stored
+        if self._allow_stored_credentials:
+            stored = _load_stored_token(self._gateway_url)
+            if stored:
+                self._cached_token = stored
+                return stored
         if not self._client_id or not self._client_secret:
             raise ValueError("provide `token`, or `client_id` + `client_secret`, or run `intyga login` first")
         
@@ -86,11 +112,13 @@ class IntygaClient:
         action_description: str,
         action_type: Optional[str] = None,
         params: Optional[Dict[str, Any]] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        target: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Request action authorization (creates a challenge)."""
         token_str = await self.token()
         payload = {
+            "target": self._resolve_target(target),
             "actionDescription": action_description,
             "actionType": action_type,
             "params": params if params is not None else {},
@@ -115,12 +143,19 @@ class IntygaClient:
         self,
         nonce: str,
         action_type: str,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        target: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Confirm that the approved signature matches the exact instruction and marks it single-use."""
+        """Confirm that the approved signature matches the exact instruction and marks it single-use.
+
+        `target` is REQUIRED by the gateway's authorizationConsume schema. Omitting it was a 400 on
+        every call, so single-use redemption was unreachable from this SDK: the challenge stayed
+        APPROVED rather than CONSUMED and remained replayable for the rest of its TTL.
+        """
         token_str = await self.token()
         payload = {
             "nonce": nonce,
+            "target": self._resolve_target(target),
             "actionType": action_type,
             "params": params if params is not None else {}
         }
@@ -156,16 +191,20 @@ class IntygaClient:
         params: Optional[Dict[str, Any]] = None,
         timeout: Optional[int] = None,
         timeout_ms: Optional[int] = None,
-        interval_ms: Optional[int] = None
+        interval_ms: Optional[int] = None,
+        target: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a challenge and block until approved, denied, or expired."""
         backend_timeout_sec = math.ceil(timeout_ms / 1000) if timeout_ms is not None else timeout
-        
+
+        # `target` must be forwarded, not dropped. The Go and Rust ports rebuilt their options
+        # struct here field-by-field and lost it on exactly this path — the one most callers use.
         auth_res = await self.authorize(
             action_description=action_description,
             action_type=action_type,
             params=params,
-            timeout=backend_timeout_sec
+            timeout=backend_timeout_sec,
+            target=target,
         )
         nonce = auth_res["nonce"]
 

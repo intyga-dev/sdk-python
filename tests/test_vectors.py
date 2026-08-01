@@ -5,6 +5,32 @@ import unittest
 
 import intyga_sdk
 
+
+def _did_anchor(approvers):
+    """DID-mode trust anchor from the vector's identity → keys table (multi-key per identity).
+
+    Mirrors `didAnchor` in packages/verify/src/vectors.test.ts: every key returned for a DID counts
+    as that ONE approver, which is what the distinct-identity quorum cases pin.
+    """
+    keys = {a["did"]: a["keys"] for a in approvers}
+    return {"dids": list(keys), "resolveKey": lambda did: keys.get(did)}
+
+
+def _expectation_for(receipt, approvers):
+    """The expectation a relying party would assert, rebuilt from the receipt's echoes.
+
+    The nonce comes from the signed canonical payload — for a golden vector, that is the challenge
+    the relying party is redeeming (mirrors `expectationFor` in the TS consumer).
+    """
+    return {
+        "approvers": approvers,
+        "target": receipt.get("target", ""),
+        "actionType": receipt.get("actionType", ""),
+        "params": receipt.get("params", {}),
+        "nonce": json.loads(receipt["canonicalPayload"])["nonce"],
+    }
+
+
 class TestGoldenVectors(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -274,6 +300,88 @@ class TestGoldenVectors(unittest.TestCase):
                 }
                 res = intyga_sdk.verify_approval_receipt(receipt, expected)
                 self.assertEqual(res.get("ok"), expect_ok, f"Failed for {name}: {res.get('reason')}")
+
+    # ── Shared receipt-level vectors: quorum / offline / delegation ───────────────────────────────
+    # Mirrors packages/verify/src/vectors.test.ts. NOTE: canonical-vectors.json also carries a
+    # `documentPayloads` section whose own `note` marks it TS-only (document signing is a
+    # gateway-side ceremony, apps/gateway/src/integrity.ts, not part of the relying-party offline
+    # surface the Go/Rust/Python ports implement) — this port deliberately has no consumer or
+    # builder for it, same as Go and Rust.
+
+    def test_quorum_receipts(self):
+        # Quorum counts distinct approver IDENTITIES, never signature entries: one approver
+        # deliberately holds TWO enrolled keys, and two signatures under them are still one approval.
+        # Same cases the TS consumer pins (packages/verify/src/vectors.test.ts).
+        section = self.vectors.get("quorumReceipts")
+        self.assertTrue(section and section.get("cases"), "no quorum receipt vectors present")
+        anchor = _did_anchor(section["approvers"])
+        for case in section["cases"]:
+            with self.subTest(name=case["name"]):
+                r = intyga_sdk.verify_approval_receipt(
+                    case["receipt"], _expectation_for(case["receipt"], anchor)
+                )
+                self.assertEqual(
+                    r.get("ok"), case["expectOk"], f"{case['name']}: {r.get('reason', '(ok)')}"
+                )
+                if case.get("expectSigners"):
+                    # A SET expectation — order is not part of the contract.
+                    self.assertEqual(
+                        sorted(r.get("signers", [])), sorted(case["expectSigners"]), case["name"]
+                    )
+                if not case["expectOk"] and case.get("expectReasonIncludes"):
+                    self.assertIn(case["expectReasonIncludes"], r.get("reason", ""), case["name"])
+
+    def test_offline_receipts(self):
+        # Pins the opt-in refusal and the 60-minute window cap: an offline proof is refused without
+        # allow_offline, and one whose signed window exceeds the cap fails even WITH the opt-in —
+        # validly signed, so what fails is the bound, not the signature.
+        cases = self.vectors.get("offlineReceipts", [])
+        self.assertTrue(cases, "no offline receipt vectors present")
+        approvers = {"publicKeys": [self.vectors["signerKey"]["spkiB64"]]}
+        for case in cases:
+            receipt = case["receipt"]
+            expected = _expectation_for(receipt, approvers)
+            with self.subTest(name=case["name"]):
+                with_opt_in = intyga_sdk.verify_approval_receipt(
+                    receipt, expected, allow_offline=True
+                )
+                self.assertEqual(
+                    with_opt_in.get("ok"),
+                    case["expectOkWithOptIn"],
+                    f"{case['name']}: {with_opt_in.get('reason', '(ok)')}",
+                )
+                if case.get("refusedWithoutOptIn"):
+                    without = intyga_sdk.verify_approval_receipt(receipt, expected)
+                    self.assertFalse(
+                        without.get("ok"),
+                        f"{case['name']} must be refused without the offline opt-in",
+                    )
+
+    def test_delegation_receipts(self):
+        # Pins the sealing quorum and the 72-hour window cap. The positive case's verdict must carry
+        # the (sorted, deduplicated) delegatedTo set and the delegated quorum — that dict is what a
+        # caller later passes as delegation= to verify_approval_receipt, so its shape is contract.
+        section = self.vectors.get("delegationReceipts")
+        self.assertTrue(section and section.get("cases"), "no delegation receipt vectors present")
+        anchor = _did_anchor(section["approvers"])
+        for case in section["cases"]:
+            receipt = case["receipt"]
+            with self.subTest(name=case["name"]):
+                r = intyga_sdk.verify_delegation(
+                    receipt,
+                    {
+                        "approvers": anchor,
+                        "target": receipt.get("target", ""),
+                        "actionType": receipt.get("actionType", ""),
+                        "params": receipt.get("params", {}),
+                    },
+                )
+                self.assertEqual(
+                    r.get("ok"), case["expectOk"], f"{case['name']}: {r.get('reason', '(ok)')}"
+                )
+                if case["expectOk"]:
+                    self.assertEqual(r["delegation"]["delegatedTo"], case["delegatedTo"])
+                    self.assertEqual(r["delegation"]["delegatedQuorum"], case["delegatedQuorum"])
 
     def test_policy_crypto(self):
         policy_data = self.vectors.get("policy", {})

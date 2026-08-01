@@ -3,8 +3,6 @@ from .client import IntygaClient
 from .crypto import (
     stable_stringify,
     canonical_challenge_payload,
-    canonical_authorization_payload,
-    canonical_authorization_payload_v3,
     canonical_delegation_payload,
     canonical_offline_intent_payload,
     canonical_intent_payload,
@@ -23,8 +21,6 @@ __all__ = [
     "IntygaClient",
     "stable_stringify",
     "canonical_challenge_payload",
-    "canonical_authorization_payload",
-    "canonical_authorization_payload_v3",
     "canonical_delegation_payload",
     "canonical_offline_intent_payload",
     "canonical_intent_payload",

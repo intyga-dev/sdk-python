@@ -32,6 +32,17 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+## Verifying an approval receipt
+
+`intyga_sdk.crypto.verify_approval_receipt` checks a receipt against keys **you** resolved — never the
+one embedded in the receipt, which would prove only that the receipt is self-consistent.
+
+> **Quorum caveat.** The trust anchor accepts either a flat public-key allowlist or a DID/identity
+> form. In key-list mode the identity IS the key, so an M-of-N quorum counts credentials, not people:
+> one approver whose two registered credentials are both listed satisfies a 2-of-N alone. For
+> `requiredApprovals` > 1 use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
+> Delegations name approver identities and are refused outright in key-list mode.
+
 ## DEWP conformance
 
 `intyga_sdk.ledger` implements the **DEWP Core primitives** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1) —

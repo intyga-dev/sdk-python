@@ -154,3 +154,49 @@ class TestLedgerVectors(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProducerAnchorClaimTest(unittest.TestCase):
+    """DEWP §6.2: surface the producer's quorum claim without ever trusting it.
+
+    Reporting the claim and evaluating it are different acts. This port evaluates no quorum, so
+    ``anchorVerified`` must stay False whatever the bundle asserts — but a reader comparing two
+    exports still needs the claim and the threshold behind it, because a deployment requiring one
+    issuer and one requiring three both publish ``externallyAnchored: true``.
+    """
+
+    def _bundle(self, **extra):
+        leaf = "a" * 64
+        bundle = {
+            "kind": "dewp.audit.inclusion-proof",
+            "proof": {
+                "leaf": leaf,
+                "blockIndex": "0",
+                "blockRoot": leaf,
+                "blockProof": [],
+                "leafIndex": 0,
+                "blockLeafCount": 1,
+                "checkpointRoot": "b" * 64,
+                "checkpointProof": [],
+                "checkpointLeafIndex": 0,
+                "checkpointLeafCount": 1,
+            },
+            "event": {},
+        }
+        bundle.update(extra)
+        return bundle
+
+    def test_claim_and_threshold_are_reported(self):
+        result = ledger.verify_bundle(self._bundle(externallyAnchored=True, externallyAnchoredRequired=2))
+        notes = " ".join(result["notes"])
+        self.assertIn("producer CLAIMS external anchoring: True", notes)
+        self.assertIn("2 distinct independent issuer(s)", notes)
+        self.assertFalse(result["properties"]["anchorVerified"], "a claim is not a check")
+
+    def test_a_claim_without_a_threshold_says_so(self):
+        result = ledger.verify_bundle(self._bundle(externallyAnchored=True))
+        self.assertIn("an unstated quorum", " ".join(result["notes"]))
+
+    def test_a_bundle_making_no_claim_gets_no_note(self):
+        result = ledger.verify_bundle(self._bundle())
+        self.assertNotIn("producer CLAIMS", " ".join(result["notes"]))

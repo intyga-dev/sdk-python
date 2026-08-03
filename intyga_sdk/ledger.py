@@ -169,11 +169,14 @@ def _jcs(value: Any) -> str:
         # Reuse the canonical formatter from crypto.py rather than a second copy of the rule.
         # Imported lazily so this module stays hashlib-only at import time (see verify_bundle).
         #
-        # KNOWN RESIDUAL: outside the portable range (1e-4 <= |x| < 1e16) Python's repr and JS
-        # still disagree (0.00001 -> "1e-05" here, "0.00001" in JS). Deliberately NOT refused: the
-        # TS reference jcs has no portability guard, and a verifier must fail-to-match on such a
-        # leaf rather than crash. Producers that need the guarantee validate at signing time
-        # (stable_stringify refuses non-portable numbers).
+        # RESIDUAL, bounded: outside the portable range (DEWP §4.3.1 — |x| < 1e16 for integers,
+        # 1e-4 <= |x| < 1e16 otherwise) Python's repr and JS can still disagree (0.00001 -> "1e-05"
+        # here, "0.00001" in JS). Deliberately NOT refused: the TS reference jcs has no guard here,
+        # and a verifier must fail-to-match on such a leaf rather than crash. A conformant producer
+        # never commits one — the reference producer refuses at ingestion (assertPortableJson in
+        # packages/db) and stable_stringify refuses on the signing path — so this is reachable only
+        # for a foreign or legacy leaf. verify-go answers the same case by refusing to canonicalize;
+        # the spec permits either, and both beat computing bytes the other ports do not share.
         from .crypto import format_jcs_number
 
         return format_jcs_number(value)
@@ -430,6 +433,24 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
             "an independently supplied root was used, but this port does not verify anchor "
             "signatures or quorum (DEWP §5.2/§5.3), so anchorVerified stays false and "
             "FULLY_VERIFIED is not reachable here — use @intyga/verify for anchor quorum"
+        )
+
+    # DEWP §6.2 asks verifiers to SURFACE the producer's own quorum claim alongside their verdict.
+    # Reporting it is not trusting it: `anchor_verified` above is the check, and stays False either
+    # way. But a reader comparing two exports needs the claim AND the threshold behind it — a
+    # deployment requiring one issuer and one requiring three both publish `externallyAnchored: true`,
+    # and the boolean alone cannot tell them apart.
+    claimed = bundle.get("externallyAnchored")
+    if claimed is None and isinstance(proof, dict):
+        claimed = proof.get("externallyAnchored")
+    if claimed is not None:
+        required = bundle.get("externallyAnchoredRequired")
+        if required is None and isinstance(proof, dict):
+            required = proof.get("externallyAnchoredRequired")
+        quorum = f"{required} distinct independent issuer(s)" if required else "an unstated quorum"
+        notes.append(
+            f"producer CLAIMS external anchoring: {claimed} (against {quorum}). Claim only — this "
+            "port evaluates no anchor quorum, so it neither confirms nor refutes it"
         )
 
     properties = {

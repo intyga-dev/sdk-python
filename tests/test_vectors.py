@@ -132,7 +132,9 @@ class TestGoldenVectors(unittest.TestCase):
                 self.assertEqual(result, case["expected"])
                 self.assertIn('"type":"div-delegation"', result)
                 self.assertIn(
-                    '"delegatedTo":["did:intyga:sre-a","did:intyga:sre-b","did:intyga:sre-c"]',
+                    # UTF-16 code-unit order: U+1F600 before U+FFFD, where Python's default
+                    # code-point sort puts it after. This pins the comparator, not just "sorted".
+                    '"delegatedTo":["did:intyga:sre-a","did:intyga:sre-c","did:intyga:sre-😀","did:intyga:sre-�"]',
                     result,
                 )
 

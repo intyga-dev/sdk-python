@@ -248,7 +248,13 @@ def _canonical_common(
         {
             "requiredApprovals": requirement.get("requiredApprovals", 1),
             "requireHardwareKey": requirement.get("requireHardwareKey", False),
-            "allowedAaguids": sorted(requirement.get("allowedAaguids", [])),
+            # UTF-16 code units, not Python's native code-point order — the same key the object keys
+            # use (line ~165). They differ only for non-BMP characters, which no AAGUID (hex UUID) or
+            # DID carries today, but a set sorted one way here and another in the TS reference
+            # produces different SIGNED BYTES, caught by nothing until a receipt fails. DIV §4.3.3.
+            "allowedAaguids": sorted(
+                requirement.get("allowedAaguids", []), key=lambda a: a.encode("utf-16-be")
+            ),
             "requesterCannotApprove": requirement.get("requesterCannotApprove", False),
         },
     )
@@ -325,7 +331,7 @@ def canonical_delegation_payload(
             "params": params,
             "requester": req,
             "requirement": rq,
-            "delegatedTo": sorted(delegated_to),
+            "delegatedTo": sorted(delegated_to, key=lambda d: d.encode("utf-16-be")),
             "delegatedQuorum": delegated_quorum,
             "nonce": nonce,
             "sealedAt": sealed_at,

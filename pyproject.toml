@@ -5,11 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "intyga-sdk"
 version = "0.1.0"
-description = "Universal Governance for Automated Operations"
+description = "Intyga SDK — require a cryptographically-signed human approval for any high-risk action, and verify the receipt offline"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{ name = "Intyga" }]
+keywords = ["authorization", "human-approval", "webauthn", "passkey", "audit", "receipts", "ai-agents"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
@@ -17,3 +19,19 @@ classifiers = [
 dependencies = [
     "cryptography>=40.0.0",
 ]
+
+# Declared explicitly rather than left to setuptools' flat-layout auto-discovery. The published
+# repo (scripts/build-public-tree.sh) vendors the shared golden vectors into a top-level vectors/
+# dir next to intyga_sdk/, and auto-discovery then sees two top-level packages and refuses to build
+# at all. Naming the package keeps the sdist/wheel to the SDK and the vectors to the repo.
+[tool.setuptools]
+packages = ["intyga_sdk"]
+
+# Ship the PEP 561 marker so type checkers consume the annotations.
+[tool.setuptools.package-data]
+intyga_sdk = ["py.typed"]
+
+[project.urls]
+Homepage = "https://www.intyga.com"
+Repository = "https://github.com/intyga-dev/sdk-python"
+Issues = "https://github.com/intyga-dev/sdk-python/issues"

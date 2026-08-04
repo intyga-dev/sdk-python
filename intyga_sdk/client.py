@@ -9,6 +9,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .errors import GatewayRefused, GatewayUnreachable
+
 def _load_stored_token(gateway_url: str) -> Optional[str]:
     try:
         creds_path = Path.home() / ".intyga" / "credentials.json"
@@ -36,7 +38,7 @@ def _sync_request(url: str, method: str = "GET", headers: Optional[Dict[str, str
             body = ""
         return e.code, body
     except urllib.error.URLError as e:
-        raise Exception(f"Connection failed: {e.reason}")
+        raise GatewayUnreachable(f"Connection failed: {e.reason}")
 
 async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
     return await asyncio.to_thread(_sync_request, url, method, headers, json_body)
@@ -101,7 +103,7 @@ class IntygaClient:
             headers={"authorization": f"Basic {basic}"}
         )
         if status < 200 or status >= 300:
-            raise Exception(f"token exchange failed: {status} {body}")
+            raise GatewayRefused(status, f"token exchange failed: {status} {body}")
         
         data = json.loads(body)
         self._cached_token = data["access_token"]
@@ -136,7 +138,7 @@ class IntygaClient:
             json_body=payload
         )
         if status < 200 or status >= 300:
-            raise Exception(f"authorize failed: {status} {body}")
+            raise GatewayRefused(status, f"authorize failed: {status} {body}")
         return json.loads(body)
 
     async def consume(
@@ -169,7 +171,7 @@ class IntygaClient:
             json_body=payload
         )
         if status < 200 or status >= 300:
-            raise Exception(f"consume failed: {status} {body}")
+            raise GatewayRefused(status, f"consume failed: {status} {body}")
         return json.loads(body)
 
     async def status(self, nonce: str) -> Dict[str, Any]:
@@ -181,7 +183,7 @@ class IntygaClient:
             headers={"authorization": f"Bearer {token_str}"}
         )
         if status < 200 or status >= 300:
-            raise Exception(f"status failed: {status} {body}")
+            raise GatewayRefused(status, f"status failed: {status} {body}")
         return json.loads(body)
 
     async def require_approval(
@@ -211,12 +213,16 @@ class IntygaClient:
         deadline = (time.time() * 1000) + (timeout_ms if timeout_ms is not None else 120000)
         interval_sec = (interval_ms / 1000) if interval_ms is not None else 2.0
 
+        # The nonce is merged into every return, terminal and expired alike — it is the challenge
+        # this result belongs to, and without it the one-shot helper's caller cannot pass
+        # `expected["nonce"]` to verify_approval_receipt or record redemption for their own
+        # single-use check. Matches @intyga/sdk, sdk-go and sdk-rust, which all set it.
         while True:
             r = await self.status(nonce)
             if r.get("status") != "PENDING":
-                return r
+                return {**r, "nonce": nonce}
             if (time.time() * 1000) > deadline:
-                return {"status": "EXPIRED"}
+                return {"status": "EXPIRED", "nonce": nonce}
             await asyncio.sleep(interval_sec)
 
     async def verify(self, document_hash: str) -> Dict[str, Any]:
@@ -226,5 +232,5 @@ class IntygaClient:
             method="GET"
         )
         if status < 200 or status >= 300:
-            raise Exception(f"verify failed: {status} {body}")
+            raise GatewayRefused(status, f"verify failed: {status} {body}")
         return json.loads(body)

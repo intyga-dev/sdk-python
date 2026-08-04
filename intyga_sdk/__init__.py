@@ -1,5 +1,7 @@
 from . import ledger
 from .client import IntygaClient
+from .errors import ApprovalRefused, GatewayRefused, GatewayUnreachable, IntygaError
+from .guard import require_human_approval
 from .crypto import (
     stable_stringify,
     canonical_challenge_payload,
@@ -19,6 +21,11 @@ from .crypto import (
 
 __all__ = [
     "IntygaClient",
+    "IntygaError",
+    "GatewayRefused",
+    "GatewayUnreachable",
+    "ApprovalRefused",
+    "require_human_approval",
     "stable_stringify",
     "canonical_challenge_payload",
     "canonical_delegation_payload",

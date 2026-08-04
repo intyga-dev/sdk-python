@@ -5,32 +5,124 @@ One SDK for every Intyga use case, implemented in Python.
 ## Installation
 
 ```bash
-pip install .
+pip install intyga-sdk
 ```
 
 ## Require a human approval before a high-risk action
 
+`target` is required — it names THIS execution environment, so the approval cannot be replayed
+against a different service (DIV Target Isolation). Issue the challenge with `authorize()` so you
+own the `nonce`: verification needs it, and it is what lets you enforce single-use yourself.
+
 ```python
 import asyncio
-from intyga_sdk import IntygaClient
+import os
+from intyga_sdk import IntygaClient, verify_approval_receipt
 
-async def main():
-    intyga = IntygaClient(
-        gateway_url="https://api.intyga.com",
-        client_id="your-client-id",
-        client_secret="your-client-secret"
+TARGET = "prod-db-cluster-01"                                   # THIS relying party — required
+APPROVERS = {"publicKeys": os.environ["INTYGA_APPROVER_KEYS"].split(",")}
+
+intyga = IntygaClient(
+    gateway_url=os.environ["INTYGA_GATEWAY_URL"],
+    client_id=os.environ["INTYGA_CLIENT_ID"],
+    client_secret=os.environ["INTYGA_CLIENT_SECRET"],
+    target=TARGET,
+)
+
+async def delete_production_database(database: str):
+    action_type, params = "wipe_production", {"database": database}
+
+    # Issue the challenge yourself so you own the nonce — verification needs it.
+    started = await intyga.authorize(
+        f"Delete production database {database}",
+        action_type=action_type,
+        params=params,
     )
+    nonce = started["nonce"]
 
-    # Blocks until the human approves with their passkey / security key (or times out):
-    r = await intyga.require_approval("Delete production database")
-    if r["status"] != "APPROVED":
-        raise Exception("not authorized")
-    
-    # safe to proceed!
+    while True:
+        approval = await intyga.status(nonce)
+        if approval["status"] != "PENDING":
+            break
+        await asyncio.sleep(2)
+    if approval["status"] != "APPROVED":
+        raise Exception(f"Not authorized: {approval['status']}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Prove it in YOUR code: re-derive the payload from the params you are about to execute.
+    # If they differ by one byte from what the human saw and signed, this fails. `approvers`
+    # is the key set YOU trust, from your own key management — never read from the receipt.
+    check = verify_approval_receipt(approval["receipt"], {
+        "target": TARGET,
+        "actionType": action_type,
+        "params": params,
+        "nonce": nonce,
+        "approvers": APPROVERS,
+    })
+    if not check["ok"]:
+        raise Exception(f"Refusing to proceed: {check['reason']}")
+    await really_drop_the_database(database)
 ```
+
+## Gate a LangChain or CrewAI tool
+
+Agent frameworks reduce a "tool" to a Python callable, so one decorator covers all of them:
+`require_human_approval` wraps any sync or async callable so it executes only after a signed human
+approval. The approver sees — and signs — the call's keyword arguments by name (positional
+arguments are refused for exactly that reason), and a refusal raises `ApprovalRefused` rather than
+returning a value, so a framework cannot mistake "the human said no" for a tool result.
+
+```python
+import os
+from intyga_sdk import IntygaClient, require_human_approval
+
+intyga = IntygaClient(
+    gateway_url=os.environ["INTYGA_GATEWAY_URL"],
+    client_id=os.environ["INTYGA_CLIENT_ID"],
+    client_secret=os.environ["INTYGA_CLIENT_SECRET"],
+    target="agent-payments-prod",
+)
+
+@require_human_approval(intyga, description="Send a wire transfer")
+def wire_transfer(*, to: str, amount: int, currency: str) -> str:
+    """Send a wire transfer to a named counterparty."""
+    return execute_transfer(to, amount, currency)
+```
+
+**LangChain** — hand the guarded callable to a structured tool as usual:
+
+```python
+from langchain_core.tools import StructuredTool
+
+transfer_tool = StructuredTool.from_function(wire_transfer)
+```
+
+**CrewAI** — stack the decorators; the guard sits under the framework's:
+
+```python
+from crewai.tools import tool
+
+@tool("wire_transfer")
+@require_human_approval(intyga, action_type="wire_transfer")
+def wire_transfer(*, to: str, amount: int) -> str:
+    """Send a wire transfer."""
+    return execute_transfer(to, amount, "USD")
+```
+
+`action_type` defaults to the function name — the name a gateway `ApprovalRule` or local policy
+matches on. A sync tool can only be guarded outside a running event loop (the guard must block on
+the human); inside async frameworks, make the tool function `async` and the guard awaits natively.
+
+## Typed errors
+
+Everything the SDK raises deliberately subclasses `IntygaError`:
+
+- `GatewayRefused` (with `.status`) — the gateway **answered** and the answer was no: 403 policy
+  refusal, 402 Protected Ops exhausted, 401/429. A verdict, not an outage.
+- `GatewayUnreachable` — transport failure: the gateway could not be asked at all.
+- `ApprovalRefused` (with `.status`: `DENIED`, `EXPIRED`, …) — a guarded call was not approved.
+
+The refusal/outage split is load-bearing (DIV §5a): a policy denial must never be handled as
+unreachability.
 
 ## Verifying an approval receipt
 

@@ -422,9 +422,13 @@ class TestTrustAnchor(unittest.TestCase):
     """
 
     def setUp(self):
-        vectors_path = (
-            Path(__file__).parent.parent.parent / "mcp-schemas" / "vectors" / "canonical-vectors.json"
-        )
+        # EXACTLY this expression, matching the other setUp methods in this file:
+        # scripts/build-public-tree.sh rewrites `current_dir.parent.parent / "mcp-schemas" /
+        # "vectors"` to the vendored repo-local path when assembling the public sdk-python repo.
+        # This class previously spelled the same path as Path(__file__).parent.parent.parent —
+        # the sed missed it, and these four tests shipped failing in the public tree.
+        current_dir = Path(__file__).parent
+        vectors_path = current_dir.parent / "vectors" / "canonical-vectors.json"
         with open(vectors_path, "r", encoding="utf-8") as f:
             self.vectors = json.load(f)
         self.receipt = {r["name"]: r["receipt"] for r in self.vectors["receipts"]}["es256-raw-p1363"]

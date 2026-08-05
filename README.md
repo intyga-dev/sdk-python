@@ -162,6 +162,10 @@ Three limits are deliberate and reported honestly rather than silently:
 - **The §5.4 checkpoint continuity chain (`0x04` domain tag) is not implemented.** It is TS-only:
   DEWP §9.1 places it outside the Core primitives this port targets. Use `@intyga/verify` to check
   a checkpoint chain.
+- **DIV §5b Agent Authority is not implemented** (`div-agent-authority` payloads and the
+  `agentAuthorityPayloads` vector section; TypeScript-only). `verify_approval_receipt`
+  correctly REFUSES the payload type — an authority authorizes no action — this port just cannot
+  verify one as governance evidence.
 
 `verify_bundle` also refuses any `kind` other than `dewp.audit.inclusion-proof` (§6.5), and declines to
 attempt leaf binding for an Application Profile other than `trust.intyga.audit.v1` (§4.5) rather than

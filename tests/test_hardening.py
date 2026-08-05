@@ -32,6 +32,7 @@ REQUIREMENT = {
     "requireHardwareKey": False,
     "allowedAaguids": [],
     "requesterCannotApprove": False,
+    "signerClass": "human",
 }
 EXPECTED = {
     "target": "t",
@@ -343,3 +344,50 @@ class TestAmbientCredentials(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSignerClassRegistry(unittest.TestCase):
+    """DIV §4.3.2 / §5-step-3a: the signerClass registry fails closed. An unrecognized class must
+    never verify as if it were human-approved, and a payload with no class predates the field and
+    cannot be verified by this version."""
+
+    def _receipt_with_class(self, signer_class):
+        from datetime import datetime, timedelta, timezone
+
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+        requirement = dict(REQUIREMENT)
+        if signer_class is None:
+            del requirement["signerClass"]
+        else:
+            requirement["signerClass"] = signer_class
+        canonical = canonical_intent_payload(
+            "t", "a", "d", {}, REQUESTER, requirement, "n", expires,
+        )
+        # The builder defaults a MISSING signerClass to "" in the bytes; strip it so the payload is
+        # genuinely pre-signerClass, as a stale producer would have emitted it.
+        if signer_class is None:
+            canonical = canonical.replace(',"signerClass":""', "")
+        return {
+            "canonicalPayload": canonical,
+            "sigAlg": "ES256",
+            "requester": REQUESTER,
+            "actionDescription": "d",
+            "signatures": [{"signerDid": "did:x:1", "signature": "AA", "publicKey": "BB"}],
+        }
+
+    def test_unrecognized_class_is_refused_not_treated_as_human(self):
+        result = verify_approval_receipt(self._receipt_with_class("delegated-agent"), EXPECTED)
+        self.assertFalse(result["ok"])
+        self.assertIn("does not recognize", result["reason"])
+        self.assertIn("delegated-agent", result["reason"])
+
+    def test_missing_class_is_refused(self):
+        result = verify_approval_receipt(self._receipt_with_class(None), EXPECTED)
+        self.assertFalse(result["ok"])
+        self.assertIn("missing signerClass", result["reason"])
+
+    def test_human_class_reaches_signature_verification(self):
+        # "human" must pass the registry gate: the junk signature is then the failure, not the class.
+        result = verify_approval_receipt(self._receipt_with_class("human"), EXPECTED)
+        self.assertFalse(result["ok"])
+        self.assertNotIn("signerClass", result["reason"])

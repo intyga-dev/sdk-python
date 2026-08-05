@@ -40,6 +40,7 @@ REQUIREMENT = {
     "requireHardwareKey": False,
     "allowedAaguids": [],
     "requesterCannotApprove": False,
+    "signerClass": "human",
 }
 PARAMS = {"environment": "prod"}
 NONCE = "off-window-test"

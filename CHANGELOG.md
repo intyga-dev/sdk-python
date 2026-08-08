@@ -16,7 +16,7 @@ All notable changes to `intyga-sdk` (Python) are documented here. The format fol
   `verify_approval_receipt` or record redemption.
 - PEP 561 `py.typed` marker shipped.
 
-## [0.1.0]
+## [1.0.0]
 
 Initial public release.
 

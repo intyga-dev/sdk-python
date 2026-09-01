@@ -11,6 +11,58 @@ from typing import Any, Dict, Optional
 
 from .errors import GatewayRefused, GatewayUnreachable
 
+# A cached exchange is served only while more than this remains of the lifetime the gateway
+# advertised in `expires_in`; past it the client re-exchanges BEFORE the token can 401 mid-poll.
+# The margin is min(60 s, expires_in / 10), so a short-lived token is not re-exchanged on every call.
+_REFRESH_MARGIN_MAX_SECONDS = 60.0
+
+_STORED_CREDENTIAL_EXPIRED = (
+    "the stored credential from `intyga login` has expired and cannot be refreshed by the SDK "
+    "(it has no client secret) — run `intyga login` again"
+)
+_STORED_CREDENTIAL_REJECTED = (
+    "the gateway rejected the stored credential from `intyga login` (401; it has most likely "
+    "expired, and the SDK cannot refresh it) — run `intyga login` again"
+)
+
+
+def _refresh_margin(expires_in: float) -> float:
+    return min(_REFRESH_MARGIN_MAX_SECONDS, expires_in / 10.0)
+
+
+def _numeric_expires_in(value: Any) -> Optional[float]:
+    """`expires_in` as seconds, or None when absent, non-numeric or non-positive — meaning "no
+    expiry known", in which case the token is cached until the gateway refuses it."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
+
+
+def _decode_jwt_exp(token: str) -> Optional[float]:
+    """Read `exp` (Unix seconds) out of a JWT payload WITHOUT verifying anything.
+
+    A hint, never a trust decision: the gateway is what verifies the signature. This exists so a
+    stored `intyga login` credential can say "expired, log in again" instead of surfacing a bare
+    401 — base64url with the padding the JWT profile strips, and None for anything that is not a
+    three-part token carrying a numeric `exp`.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload = parts[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        exp = claims.get("exp") if isinstance(claims, dict) else None
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+            return None
+        return float(exp)
+    except Exception:
+        return None
+
+
 def _load_stored_token(gateway_url: str) -> Optional[str]:
     try:
         creds_path = Path.home() / ".intyga" / "credentials.json"
@@ -71,7 +123,13 @@ class IntygaClient:
         self._client_secret = client_secret
         self._target = target
         self._allow_stored_credentials = allow_stored_credentials
-        self._cached_token = None
+        # The cache: the token, where it came from ("exchange" — re-exchangeable from
+        # client_id/client_secret — or "stored", an `intyga login` credential nothing here can
+        # renew), and when it expires on time.monotonic() (None = unknown; cache until a 401).
+        self._cached_token: Optional[str] = None
+        self._cached_source: Optional[str] = None
+        self._cached_expires_at: Optional[float] = None
+        self._cached_margin: float = 0.0
 
     def _resolve_target(self, target: Optional[str]) -> str:
         resolved = target if target is not None else self._target
@@ -82,20 +140,61 @@ class IntygaClient:
             )
         return resolved.strip()
 
+    def _invalidate_token(self) -> None:
+        """Drop the cached token so the next `token()` re-resolves it (re-exchange or re-read)."""
+        self._cached_token = None
+        self._cached_source = None
+        self._cached_expires_at = None
+        self._cached_margin = 0.0
+
+    def _cache_is_fresh(self) -> bool:
+        if self._cached_expires_at is None:
+            return True
+        return time.monotonic() < self._cached_expires_at - self._cached_margin
+
     async def token(self) -> str:
-        """Resolve a bearer token: the provided one, a cached exchange, or a fresh client-credentials exchange."""
+        """Resolve a bearer token: the provided one, a still-fresh cached one, a stored `intyga login`
+        credential, or a fresh client-credentials exchange.
+
+        An exchanged token is cached until shortly before the `expires_in` the gateway advertised
+        (see `_REFRESH_MARGIN_MAX_SECONDS`) and then exchanged again, so a long-lived service or a
+        long `require_approval` poll never dies at token expiry. A stored credential has no secret
+        to re-exchange with: its JWT `exp` is decoded (unverified — a hint for the error message
+        only) and an expired one raises `GatewayRefused(401)` naming `intyga login` as the fix.
+        """
         if self._token:
             return self._token
-        if self._cached_token:
-            return self._cached_token
+        cached = self._cached_token
+        if cached is not None and self._cache_is_fresh():
+            return cached
+        self._invalidate_token()
         if self._allow_stored_credentials:
             stored = _load_stored_token(self._gateway_url)
             if stored:
+                exp = _decode_jwt_exp(stored)
+                if exp is not None:
+                    remaining = exp - time.time()
+                    if remaining <= 0:
+                        raise GatewayRefused(401, _STORED_CREDENTIAL_EXPIRED)
+                    # Wall-clock `exp` mapped onto the monotonic clock; margin 0 because there is
+                    # nothing to renew it with, so it is served for its whole remaining life.
+                    self._cached_expires_at = time.monotonic() + remaining
                 self._cached_token = stored
+                self._cached_source = "stored"
                 return stored
+        return await self._exchange()
+
+    async def _exchange(self) -> str:
+        """The client-credentials exchange itself, bypassing the stored-credential lookup.
+
+        The 401 retry in `_request_authed` calls this directly: going back through `token()` would
+        consult `~/.intyga/credentials.json` first, so a process configured with BOTH a stored
+        `intyga login` token and client credentials could retry an agent call as the human — a
+        different principal, a different ceremony shape, and a different requester on the witness leaf.
+        """
         if not self._client_id or not self._client_secret:
             raise ValueError("provide `token`, or `client_id` + `client_secret`, or run `intyga login` first")
-        
+
         basic = base64.b64encode(f"{self._client_id}:{self._client_secret}".encode("utf-8")).decode("utf-8")
         status, body = await _async_request(
             f"{self._gateway_url}/oauth/token",
@@ -104,10 +203,49 @@ class IntygaClient:
         )
         if status < 200 or status >= 300:
             raise GatewayRefused(status, f"token exchange failed: {status} {body}")
-        
+
         data = json.loads(body)
-        self._cached_token = data["access_token"]
-        return self._cached_token
+        access_token = data["access_token"]
+        expires_in = _numeric_expires_in(data.get("expires_in"))
+        self._cached_token = access_token
+        self._cached_source = "exchange"
+        if expires_in is not None:
+            self._cached_expires_at = time.monotonic() + expires_in
+            self._cached_margin = _refresh_margin(expires_in)
+        return access_token
+
+    async def _request_authed(
+        self,
+        op: str,
+        url: str,
+        method: str = "GET",
+        json_body: Optional[Any] = None,
+        _retried: bool = False,
+    ) -> Dict[str, Any]:
+        """One bearer-authenticated request, parsed as JSON; every non-2xx raises GatewayRefused.
+
+        A 401 against a token this client exchanged itself — not an explicit `token`, not a stored
+        credential — clears the cache and retries exactly once with a fresh client-credentials
+        exchange (never a stored credential — see `_exchange`). The margin in
+        `token()` handles ordinary expiry; this covers clock skew and a gateway-side TTL change. An
+        explicit token has nothing to re-exchange, so its 401 is the verdict it always was, and a
+        stored `intyga login` credential gets the authored "log in again" error instead.
+        """
+        token_str = await (self._exchange() if _retried else self.token())
+        headers = {"authorization": f"Bearer {token_str}"}
+        if json_body is not None:
+            headers["content-type"] = "application/json"
+        status, body = await _async_request(url, method=method, headers=headers, json_body=json_body)
+        if status == 401 and not self._token:
+            if self._cached_source == "exchange" and not _retried:
+                self._invalidate_token()
+                return await self._request_authed(op, url, method=method, json_body=json_body, _retried=True)
+            if self._cached_source == "stored":
+                self._invalidate_token()
+                raise GatewayRefused(401, f"{op} failed: {_STORED_CREDENTIAL_REJECTED}")
+        if status < 200 or status >= 300:
+            raise GatewayRefused(status, f"{op} failed: {status} {body}")
+        return json.loads(body)
 
     async def authorize(
         self,
@@ -118,7 +256,6 @@ class IntygaClient:
         target: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Request action authorization (creates a challenge)."""
-        token_str = await self.token()
         payload = {
             "target": self._resolve_target(target),
             "actionDescription": action_description,
@@ -128,18 +265,9 @@ class IntygaClient:
         if timeout is not None:
             payload["timeout"] = timeout
 
-        status, body = await _async_request(
-            f"{self._gateway_url}/authorize",
-            method="POST",
-            headers={
-                "authorization": f"Bearer {token_str}",
-                "content-type": "application/json"
-            },
-            json_body=payload
+        return await self._request_authed(
+            "authorize", f"{self._gateway_url}/authorize", method="POST", json_body=payload
         )
-        if status < 200 or status >= 300:
-            raise GatewayRefused(status, f"authorize failed: {status} {body}")
-        return json.loads(body)
 
     async def consume(
         self,
@@ -154,37 +282,21 @@ class IntygaClient:
         every call, so single-use redemption was unreachable from this SDK: the challenge stayed
         APPROVED rather than CONSUMED and remained replayable for the rest of its TTL.
         """
-        token_str = await self.token()
         payload = {
             "nonce": nonce,
             "target": self._resolve_target(target),
             "actionType": action_type,
             "params": params if params is not None else {}
         }
-        status, body = await _async_request(
-            f"{self._gateway_url}/authorize/verify",
-            method="POST",
-            headers={
-                "authorization": f"Bearer {token_str}",
-                "content-type": "application/json"
-            },
-            json_body=payload
+        return await self._request_authed(
+            "consume", f"{self._gateway_url}/authorize/verify", method="POST", json_body=payload
         )
-        if status < 200 or status >= 300:
-            raise GatewayRefused(status, f"consume failed: {status} {body}")
-        return json.loads(body)
 
     async def status(self, nonce: str) -> Dict[str, Any]:
         """Poll a challenge's current status (non-blocking)."""
-        token_str = await self.token()
-        status, body = await _async_request(
-            f"{self._gateway_url}/authorize/{urllib.parse.quote(nonce)}",
-            method="GET",
-            headers={"authorization": f"Bearer {token_str}"}
+        return await self._request_authed(
+            "status", f"{self._gateway_url}/authorize/{urllib.parse.quote(nonce)}", method="GET"
         )
-        if status < 200 or status >= 300:
-            raise GatewayRefused(status, f"status failed: {status} {body}")
-        return json.loads(body)
 
     async def require_approval(
         self,

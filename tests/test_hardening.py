@@ -74,6 +74,14 @@ class TestParameterBinding(unittest.TestCase):
             with self.assertRaises(NonCanonicalValue, msg=f"{value!r} should be refused"):
                 stable_stringify(value)
 
+    def test_an_int_above_the_double_range_is_a_refusal_not_an_OverflowError(self):
+        # `math.isnan` converts to double first, so an arbitrary-precision int raised OverflowError
+        # out of the public signing APIs instead of the documented NonCanonicalValue contract.
+        with self.assertRaises(NonCanonicalValue):
+            stable_stringify({"a": 10 ** 400})
+        with self.assertRaises(NonCanonicalValue):
+            stable_stringify(-(10 ** 400))
+
     def test_portable_numbers_still_work(self):
         self.assertEqual(stable_stringify(0.5), "0.5")
         self.assertEqual(stable_stringify(9007199254740991), "9007199254740991")
@@ -206,20 +214,33 @@ class TestDelegationWitnessCap(unittest.TestCase):
             ],
         }
 
+    # DID mode: delegations refuse a key-set anchor outright (DIV §4.4.6), and these tests are
+    # about the witness cap and reason folding, which must still be reached. The allowlist covers
+    # every junk witness DID so each one fails at SIGNATURE verification, as the fold test counts.
+    DELEGATION_EXPECTED = {
+        **EXPECTED,
+        "approvers": {
+            "dids": [f"did:x:{i}" for i in range(MAX_WITNESSES + 1)],
+            "resolveKey": lambda did: "AAAA",
+        },
+    }
+
     def test_witness_list_above_the_cap_is_refused_before_verification(self):
-        result = verify_delegation(self._delegation_receipt(MAX_WITNESSES + 1), EXPECTED)
+        result = verify_delegation(self._delegation_receipt(MAX_WITNESSES + 1), self.DELEGATION_EXPECTED)
         self.assertFalse(result["ok"])
         self.assertIn("above the maximum", result["reason"])
 
     def test_a_quorum_sized_witness_list_still_reaches_verification(self):
         # The cap must not become the reason a legitimate multi-signature delegation is refused.
-        result = verify_delegation(self._delegation_receipt(3), EXPECTED)
+        result = verify_delegation(self._delegation_receipt(3), self.DELEGATION_EXPECTED)
         self.assertFalse(result["ok"])  # the signatures are junk, so it still fails
         self.assertNotIn("above the maximum", result["reason"])  # but not because of the cap
 
     def test_failure_reasons_are_folded_not_joined_unbounded(self):
         # An unbounded join over the witness list was itself the memory half of the amplification.
-        result = verify_delegation(self._delegation_receipt(MAX_REPORTED_FAILURES + 4), EXPECTED)
+        result = verify_delegation(
+            self._delegation_receipt(MAX_REPORTED_FAILURES + 4), self.DELEGATION_EXPECTED
+        )
         self.assertFalse(result["ok"])
         self.assertIn("+4 more", result["reason"])
         self.assertEqual(result["reason"].count("signature does not verify"), MAX_REPORTED_FAILURES)

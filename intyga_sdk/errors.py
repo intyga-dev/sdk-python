@@ -17,8 +17,8 @@ class IntygaError(Exception):
 class GatewayRefused(IntygaError):
     """The gateway answered, and the answer was no (any non-2xx). A verdict, not an outage.
 
-    `status` carries the HTTP status code: 403 is a fail-closed policy refusal, 402 means
-    Protected Ops are exhausted, 401/429 are equally deliberate.
+    `status` carries the HTTP status code: 403 is a fail-closed policy refusal, while 401/429 are
+    equally deliberate. Usage has not produced 402 since Protected Ops stopped being capped.
     """
 
     def __init__(self, status: int, message: str):

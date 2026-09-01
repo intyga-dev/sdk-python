@@ -96,7 +96,7 @@ def verify_merkle_proof(
     # `bounds` is REQUIRED (see above), but Python enforces nothing at the boundary of an untyped
     # caller — `bounds.get(...)` on `None` would raise AttributeError instead of returning a bool.
     # Refusing here keeps this a predicate for that caller instead of a crash.
-    if not isinstance(bounds, dict):
+    if not isinstance(bounds, dict) or not isinstance(proof, list):
         return False
     index = bounds.get("index")
     leaf_count = bounds.get("leafCount")
@@ -220,16 +220,24 @@ def verify_inclusion_proof(proof: Dict[str, Any], daily_root: str) -> bool:
 
     Each hop is bounded by its position (DEWP §3 invariant 3, steps 1 and 2). A proof that cannot say
     where its leaf sits does not establish inclusion, so missing position fields are a rejection.
+
+    Every field is read with ``get``, for the reason ``verify_merkle_proof`` states about ``bounds``:
+    this is a documented predicate, and a relying party calling it directly on a malformed artifact
+    must get ``False`` rather than a ``KeyError`` a caller could handle as something other than a
+    refusal. ``verify_bundle``'s try/except used to be the only thing hiding that.
     """
+    if not isinstance(proof, dict):
+        return False
+    block_root = proof.get("blockRoot")
     if not verify_merkle_proof(
-        proof["leaf"],
+        proof.get("leaf"),
         proof.get("blockProof", []),
-        proof["blockRoot"],
+        block_root,
         {"index": proof.get("leafIndex"), "leafCount": proof.get("blockLeafCount")},
     ):
         return False
     return verify_merkle_proof(
-        hash_leaf(proof["blockRoot"]),
+        hash_leaf(block_root),
         proof.get("checkpointProof", []),
         daily_root,
         {
@@ -283,21 +291,26 @@ def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) ->
 
         # Imported here, not at module top: bundle verification deliberately needs only hashlib,
         # and this primitive is the one place the ledger module touches real crypto.
-        import base64
-
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric import ec
         from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
-        public_key = serialization.load_der_public_key(base64.b64decode(public_key_spki_b64))
+        # base64url as well as standard, matching the rest of this package and `Buffer.from(s,
+        # "base64")` in @intyga/verify. `base64.b64decode` without `validate` silently DISCARDS `-`
+        # and `_` instead of erroring, so a base64url-encoded issuer key or signature — which §5.2
+        # exists to admit, from issuers the producer does not control — decoded to different bytes
+        # here and read as an invalid signature on input the TS reference accepts.
+        from .crypto import base64_decode_flexible
+
+        public_key = serialization.load_der_public_key(base64_decode_flexible(public_key_spki_b64))
         if not isinstance(public_key, ec.EllipticCurvePublicKey):
             return False
         if not isinstance(public_key.curve, ec.SECP256R1):
             return False
 
         digest = bytes.fromhex(anchor_digest_hex(anchor))
-        signature = base64.b64decode(signature_b64)
+        signature = base64_decode_flexible(signature_b64)
 
         # Raw IEEE-P1363 (r||s) is always exactly 64 bytes for P-256; DER can in principle also be
         # 64, so length is not a reliable discriminator — try both encodings rather than inferring.
@@ -343,9 +356,11 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
         return _invalid("bundle.event.canonical is present but not an object")
     leaf = proof.get("leaf")
 
-    # DEWP §6.5: a compliant verifier MUST reject any kind other than the ones it implements.
+    # DEWP §6.5: a compliant verifier MUST reject any kind other than the ones it implements — and
+    # the authoritative JSON Schema (docs/schemas/dewp/inclusion-proof.schema.json) makes `kind`
+    # required, so an ABSENT kind is refused too, matching the TS reference.
     kind = bundle.get("kind")
-    if kind is not None and kind != BUNDLE_KIND:
+    if kind != BUNDLE_KIND:
         return _invalid(f'refusing bundle kind "{kind}" (expected "{BUNDLE_KIND}") — DEWP §6.5')
 
     # DEWP §4.5: an unknown Application Profile means the leaf layout is one this port cannot
@@ -361,15 +376,31 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
 
     anchor = bundle.get("anchor")
     anchor = anchor if isinstance(anchor, dict) else {}
+    legacy_anchor = bundle.get("legacyAnchor")
+    legacy_anchor = legacy_anchor if isinstance(legacy_anchor, dict) else {}
+    # The root the bundle asserts about itself, in the TS reference's order: the signed anchor, then
+    # the legacy pre-§6.2 `anchor` object, then the proof's own checkpoint root. All three are
+    # equally self-asserted, which is why none of them can make the bundle `ok`. Stopping at the
+    # first of the three reported INVALID — the verdict that reads as "forged" — for the reference
+    # producer's ORDINARY export, which omits `anchor` entirely until signed anchors exist.
+    self_asserted_root = (
+        anchor.get("dailyRoot") or legacy_anchor.get("dailyRoot") or proof.get("checkpointRoot")
+    )
     if trusted_root is not None:
         daily_root = trusted_root
         root_source = "independent"
-    elif anchor.get("dailyRoot"):
-        daily_root = anchor["dailyRoot"]
+    elif self_asserted_root:
+        daily_root = self_asserted_root
         root_source = "self-asserted"
+        notes.append(
+            "no independent root supplied — verifying against the root inside the bundle. This "
+            "proves the bundle is internally consistent, NOT that it matches the anchored log; "
+            "re-run with the root from the external anchor for a real verdict"
+        )
     else:
         daily_root = None
         root_source = "none"
+        notes.append("no daily root available (event not yet committed to an anchored checkpoint)")
 
     try:
         inclusion_ok = daily_root is not None and verify_inclusion_proof(proof, daily_root)
@@ -416,6 +447,14 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
             notes.append(f"{mismatch} — the bundle displays something other than what was committed")
 
     content_verified = bool(commitment_verified and leaf_binding is True and header_binding is not False)
+
+    # `ok` is the flag callers branch on (`if not ok: raise`), so a NOT-APPLICABLE leaf binding must
+    # be distinguished from a failed one. A redacted, commitment-only entry ships no preimage by
+    # design (DEWP §15: verify inclusion against the retained leaf and do NOT attempt contentVerified),
+    # and requiring content_verified rejected that valid export. An unknown `profile` is the case
+    # that must still disqualify: a prover could otherwise switch leaf binding off for content the
+    # bundle DID ship. Mirrors `contentBoundWhenPresent` in @intyga/verify ledger-bundle.ts.
+    content_bound_when_present = (leaf_binding is True) if canonical is not None else True
 
     # signatureVerified would re-verify the embedded DIV ES256 signature; kept out of this port to
     # avoid pulling a crypto dependency into the ledger module (the TS verifier does it). Reporting
@@ -478,9 +517,10 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
     return {
         "ok": bool(
             commitment_verified
-            and content_verified
             and root_source == "independent"
-            and not unknown_profile
+            and leaf_binding is not False
+            and header_binding is not False
+            and content_bound_when_present
         ),
         "rootSource": root_source,
         "properties": properties,

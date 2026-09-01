@@ -1,5 +1,8 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel"]
+# 77.0.0, not 61: the metadata below uses the PEP 639 forms (`license` as a bare SPDX string and a
+# `license-files` key), which earlier setuptools validates against the PEP 621 table form and
+# rejects. A resolver picking anything in 61..76 — permitted by the old pin — failed the build.
+requires = ["setuptools>=77.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]

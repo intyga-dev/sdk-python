@@ -200,3 +200,170 @@ class ProducerAnchorClaimTest(unittest.TestCase):
     def test_a_bundle_making_no_claim_gets_no_note(self):
         result = ledger.verify_bundle(self._bundle())
         self.assertNotIn("producer CLAIMS", " ".join(result["notes"]))
+
+
+class BundleRootSelectionTest(unittest.TestCase):
+    """DEWP §7.1 root selection, mirroring @intyga/verify's fallback chain.
+
+    Python stopped at ``anchor.dailyRoot``, but the reference producer omits ``anchor`` entirely
+    until signed anchors exist (`apps/web/app/api/audit/proof/[seq]/route.ts`). The ordinary console
+    export therefore reported ``INVALID`` — the verdict that reads as "forged" — for an untampered
+    bundle that @intyga/verify reports as self-asserted and CONTENT_VERIFIED.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        current_dir = Path(__file__).parent
+        p = current_dir.parent / "vectors" / "ledger-vectors.json"
+        with open(p, "r", encoding="utf-8") as f:
+            cls.v = json.load(f)
+
+    def _bundle(self, **over):
+        inc = self.v["inclusion"]
+        bundle = {
+            "kind": ledger.BUNDLE_KIND,
+            "event": {"canonical": inc["leafRow"]},
+            "proof": {
+                "leaf": inc["leaf"],
+                "blockRoot": inc["blockRoot"],
+                "blockProof": inc["blockProof"],
+                "leafIndex": inc["leafIndex"],
+                "blockLeafCount": inc["blockLeafCount"],
+                "checkpointProof": inc["checkpointProof"],
+                "checkpointLeafIndex": inc["checkpointLeafIndex"],
+                "checkpointLeafCount": inc["checkpointLeafCount"],
+                "checkpointRoot": inc["dailyRoot"],
+            },
+        }
+        bundle.update(over)
+        return bundle
+
+    def test_no_anchor_key_falls_back_to_the_proofs_own_checkpoint_root(self):
+        res = ledger.verify_bundle(self._bundle())
+        self.assertEqual(res["rootSource"], "self-asserted")
+        self.assertTrue(res["properties"]["commitmentVerified"])
+        self.assertEqual(res["verificationLevel"], "CONTENT_VERIFIED")
+        # Self-asserted is still not a verdict (DEWP §3.6), so it must not be ok.
+        self.assertFalse(res["ok"])
+
+    def test_legacy_anchor_is_read_before_the_proof_root(self):
+        res = ledger.verify_bundle(
+            self._bundle(legacyAnchor={"dailyRoot": self.v["inclusion"]["dailyRoot"]})
+        )
+        self.assertEqual(res["rootSource"], "self-asserted")
+        self.assertTrue(res["properties"]["commitmentVerified"])
+
+    def test_a_bundle_with_no_root_anywhere_still_reports_none(self):
+        b = self._bundle()
+        del b["proof"]["checkpointRoot"]
+        res = ledger.verify_bundle(b)
+        self.assertEqual(res["rootSource"], "none")
+        self.assertEqual(res["verificationLevel"], "INVALID")
+
+
+class RedactedBundleTest(unittest.TestCase):
+    """DEWP §15: a COMMITMENT_ONLY entry retains the leaf and ships no preimage.
+
+    ``ok`` required contentVerified, which requires a leaf binding, which a redacted export cannot
+    supply — so a lawfully redacted bundle was rejected here and accepted by @intyga/verify.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        current_dir = Path(__file__).parent
+        p = current_dir.parent / "vectors" / "ledger-vectors.json"
+        with open(p, "r", encoding="utf-8") as f:
+            cls.v = json.load(f)
+
+    def _bundle(self, **over):
+        inc = self.v["inclusion"]
+        bundle = {
+            "kind": ledger.BUNDLE_KIND,
+            "event": {"canonical": inc["leafRow"]},
+            "proof": {
+                "leaf": inc["leaf"],
+                "blockRoot": inc["blockRoot"],
+                "blockProof": inc["blockProof"],
+                "leafIndex": inc["leafIndex"],
+                "blockLeafCount": inc["blockLeafCount"],
+                "checkpointProof": inc["checkpointProof"],
+                "checkpointLeafIndex": inc["checkpointLeafIndex"],
+                "checkpointLeafCount": inc["checkpointLeafCount"],
+                "checkpointRoot": inc["dailyRoot"],
+            },
+        }
+        bundle.update(over)
+        return bundle
+
+    def test_a_redacted_entry_stays_ok_at_commitment_verified(self):
+        b = self._bundle(event={})
+        res = ledger.verify_bundle(b, trusted_root=self.v["inclusion"]["dailyRoot"])
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["verificationLevel"], "COMMITMENT_VERIFIED")
+        self.assertTrue(res["properties"]["commitmentVerified"])
+        self.assertFalse(res["properties"]["contentVerified"])
+        self.assertIsNone(res["checks"]["leafBinding"])
+
+    def test_an_unknown_profile_over_a_shipped_preimage_is_still_not_ok(self):
+        # The security case the redaction allowance must not open: a prover-supplied `profile` must
+        # never switch leaf binding off for content the bundle DID ship.
+        res = ledger.verify_bundle(
+            self._bundle(profile="someone.else.v9"),
+            trusted_root=self.v["inclusion"]["dailyRoot"],
+        )
+        self.assertFalse(res["ok"])
+        self.assertIsNone(res["checks"]["leafBinding"])
+
+    def test_a_mismatched_leaf_is_still_not_ok(self):
+        res = ledger.verify_bundle(
+            self._bundle(event={"canonical": dict(self.v["inclusion"]["leafRow"], detail="tampered")}),
+            trusted_root=self.v["inclusion"]["dailyRoot"],
+        )
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["checks"]["leafBinding"])
+
+
+class InclusionProofPredicateTest(unittest.TestCase):
+    """``verify_inclusion_proof`` is a documented public primitive, so malformed input is False.
+
+    It indexed ``proof["leaf"]`` and ``proof["blockRoot"]`` directly, so a relying party calling it
+    outside ``verify_bundle``'s try/except got a KeyError — and a caller treating an exception as
+    anything other than a refusal fails open.
+    """
+
+    def test_malformed_proofs_return_false_rather_than_raising(self):
+        for name, proof in {
+            "no leaf": {"blockRoot": "a" * 64},
+            "no blockRoot": {"leaf": "a" * 64},
+            "empty": {},
+            "not a dict": None,
+            "blockProof is not a list": {"leaf": "a" * 64, "blockRoot": "a" * 64, "blockProof": "x"},
+        }.items():
+            with self.subTest(name):
+                self.assertFalse(ledger.verify_inclusion_proof(proof, "b" * 64))
+
+
+class AnchorSignatureAlphabetTest(unittest.TestCase):
+    """DEWP §5.2 admits anchors from issuers the producer does not control, so the encoding of a
+    key or signature is not ours to assume. ``base64.b64decode`` without ``validate`` silently
+    DISCARDS ``-`` and ``_`` rather than erroring, so a base64url-encoded anchor decoded to
+    different bytes here and read as an invalid signature on input @intyga/verify accepts."""
+
+    @classmethod
+    def setUpClass(cls):
+        current_dir = Path(__file__).parent
+        p = current_dir.parent / "vectors" / "ledger-vectors.json"
+        with open(p, "r", encoding="utf-8") as f:
+            cls.v = json.load(f)
+
+    @staticmethod
+    def _to_b64url(s: str) -> str:
+        return s.replace("+", "-").replace("/", "_").rstrip("=")
+
+    def test_base64url_key_and_signature_verify_identically(self):
+        sa = self.v["signedAnchor"]
+        anchor = sa["cases"][0]["anchor"]
+        spki = sa["signerKey"]["spkiB64"]
+        self.assertTrue(ledger.verify_anchor_signature(anchor, spki))
+        url_anchor = dict(anchor, signature=self._to_b64url(anchor["signature"]))
+        self.assertTrue(ledger.verify_anchor_signature(url_anchor, self._to_b64url(spki)))

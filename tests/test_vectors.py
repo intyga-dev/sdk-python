@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 import unittest
 
@@ -14,6 +15,18 @@ def _did_anchor(approvers):
     """
     keys = {a["did"]: a["keys"] for a in approvers}
     return {"dids": list(keys), "resolveKey": lambda did: keys.get(did)}
+
+
+def _as_of(name, case):
+    """A case's committed evaluation time (DIV §5a.3 rule 3).
+
+    Raises rather than defaulting to the wall clock: a missing `asOf` would silently restore the
+    position-blind behaviour these vectors exist to pin against.
+    """
+    raw = case.get("asOf")
+    if not isinstance(raw, str) or not raw:
+        raise AssertionError(f"{name}: vector carries no usable asOf")
+    return datetime.fromisoformat(raw.replace("Z", "+00:00"))
 
 
 def _expectation_for(receipt, approvers):
@@ -302,6 +315,12 @@ class TestGoldenVectors(unittest.TestCase):
                 }
                 res = intyga_sdk.verify_approval_receipt(receipt, expected)
                 self.assertEqual(res.get("ok"), expect_ok, f"Failed for {name}: {res.get('reason')}")
+                # Pinning the REASON, not just the refusal: `0 >= 0` makes DIV §5 step 7 true with
+                # nothing counted, so this receipt can be refused for the right rule or for none.
+                if name == "zero-required-approvals-refused":
+                    self.assertIn(
+                        "requiredApprovals must be an integer of at least 1", res.get("reason", "")
+                    )
 
     # ── Shared receipt-level vectors: quorum / offline / delegation ───────────────────────────────
     # Mirrors packages/verify/src/vectors.test.ts. NOTE: canonical-vectors.json also carries a
@@ -344,8 +363,9 @@ class TestGoldenVectors(unittest.TestCase):
             receipt = case["receipt"]
             expected = _expectation_for(receipt, approvers)
             with self.subTest(name=case["name"]):
+                as_of = _as_of(case["name"], case)
                 with_opt_in = intyga_sdk.verify_approval_receipt(
-                    receipt, expected, allow_offline=True
+                    receipt, expected, allow_offline=True, as_of=as_of
                 )
                 self.assertEqual(
                     with_opt_in.get("ok"),
@@ -353,11 +373,19 @@ class TestGoldenVectors(unittest.TestCase):
                     f"{case['name']}: {with_opt_in.get('reason', '(ok)')}",
                 )
                 if case.get("refusedWithoutOptIn"):
-                    without = intyga_sdk.verify_approval_receipt(receipt, expected)
+                    without = intyga_sdk.verify_approval_receipt(receipt, expected, as_of=as_of)
                     self.assertFalse(
                         without.get("ok"),
                         f"{case['name']} must be refused without the offline opt-in",
                     )
+                # The forward-dating rule sits outside allow_expired's reach: that override
+                # re-examines a proof that WAS valid and has lapsed, never one dated ahead.
+                if case["name"] == "offline-forward-dated-refused":
+                    audit = intyga_sdk.verify_approval_receipt(
+                        receipt, expected, allow_offline=True, allow_expired=True, as_of=as_of
+                    )
+                    self.assertFalse(audit.get("ok"), case["name"])
+                    self.assertIn("challenged in the future", audit.get("reason", ""))
 
     def test_delegation_receipts(self):
         # Pins the sealing quorum and the 72-hour window cap. The positive case's verdict must carry
@@ -377,6 +405,7 @@ class TestGoldenVectors(unittest.TestCase):
                         "actionType": receipt.get("actionType", ""),
                         "params": receipt.get("params", {}),
                     },
+                    as_of=_as_of(case["name"], case),
                 )
                 self.assertEqual(
                     r.get("ok"), case["expectOk"], f"{case['name']}: {r.get('reason', '(ok)')}"

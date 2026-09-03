@@ -21,10 +21,14 @@ GW = "https://gw.example"
 
 
 class FakeClock:
-    """time.monotonic() stand-in: a real snapshot plus an offset the test advances."""
+    """time.monotonic() stand-in: an exact base plus an offset the test advances."""
 
     def __init__(self):
-        self._base = time.monotonic()
+        # Keep the base exactly representable. A fractional real monotonic snapshot made the
+        # boundary assertion compare `base + 840` with `(base + 900) - 60`; depending on the
+        # snapshot, the second expression can be one ULP larger and keep the token cached for a
+        # fraction of a nanosecond. That made identical CI jobs disagree about the exact boundary.
+        self._base = 1_000_000.0
         self.offset = 0.0
 
     def __call__(self) -> float:

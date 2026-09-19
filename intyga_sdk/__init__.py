@@ -16,6 +16,11 @@ from .crypto import (
     verify_ecdsa_p256,
     verify_approval_receipt,
     verify_delegation,
+    canonical_agent_authority_payload,
+    canonical_platform_intent_payload,
+    verify_agent_authority,
+    verify_platform_receipt,
+    self_certifying_did,
     PolicyCrypto as policy,
 )
 
@@ -39,6 +44,11 @@ __all__ = [
     "verify_ecdsa_p256",
     "verify_approval_receipt",
     "verify_delegation",
+    "canonical_agent_authority_payload",
+    "canonical_platform_intent_payload",
+    "verify_agent_authority",
+    "verify_platform_receipt",
+    "self_certifying_did",
     "policy",
     "ledger",
 ]

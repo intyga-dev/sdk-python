@@ -68,6 +68,8 @@ async def delete_production_database(database: str):
     )
     if not check["ok"]:
         raise Exception(f"Refusing to proceed: {check['reason']}")
+    # Redeem the exact verified instruction before executing so this nonce is single-use.
+    await intyga.consume(nonce, action_type, params=params)
     await really_drop_the_database(database)
 ```
 
@@ -76,6 +78,15 @@ it automatically shortly before the `expires_in` the gateway advertised (and onc
 unexpected 401), so a long-lived service or a long poll never dies at token expiry. A stored
 `intyga login` credential cannot be refreshed: when it expires the SDK raises `GatewayRefused`
 telling you to run `intyga login` again.
+
+`require_approval(timeout=600)` uses 600 seconds for both the gateway TTL and local approval wait;
+`timeout_ms`, when supplied, takes precedence. A monotonic deadline prevents accepting late results
+and cancels HTTP I/O, including a slowly streaming response. Python's OS hostname resolver can
+outlive cancellation and delay `asyncio.run()` shutdown if DNS stalls; the deadline is not a hard
+bound on process shutdown. Literal-IP loopback tests cover active HTTP connection cancellation.
+HTTP transport uses HTTPX's cancellable async client with the operating system TLS trust store.
+Authenticated redirects are refused, and approval polling applies one monotonic total deadline to
+token exchange, challenge creation, status responses and their complete response bodies.
 
 ## Gate a LangChain or CrewAI tool
 
@@ -112,6 +123,11 @@ challenge under and the kwargs it is about to execute, verifies the receipt's si
 **your** keys, redeems the nonce (`consume`) so the approval is single-use, and only then calls the
 function. A result carrying no `receipt` is a refusal. Pass `expected_origin` and `expected_rp_id`
 too — a WEBAUTHN witness is not countable without them (DIV §4.4.5, fail-closed when unset).
+The guard first validates and deep-copies the keyword arguments as canonical JSON; approval,
+verification, consumption and execution all use that detached snapshot, so another task cannot
+replace a nested value while an HTTP request is pending. The function therefore receives JSON
+types — a tuple arrives as a list, and `1.0` as `1` — and an argument with no portable JSON form
+(NaN, `-0.0`, integers outside the portable range) is refused before any challenge is created.
 
 **Without `approvers` nothing is verified.** The guard then gates on the gateway's `status` string
 alone: it never reads the receipt, checks no signature, and does not redeem the nonce. That is
@@ -173,11 +189,9 @@ receipts carry no assertion, so the two values are simply unused there.
 
 > **Quorum caveat.** The trust anchor accepts either a flat public-key allowlist or a DID/identity
 > form. In key-list mode the identity IS the key, so an M-of-N quorum counts credentials, not people:
-> one approver whose two registered credentials are both listed satisfies a 2-of-N alone. The same
-> limitation weakens `requesterCannotApprove`: the witness's `signerDid` is an unverified string in
-> key-list mode, so a requester holding a listed key can evade the four-eyes exclusion by naming a
-> different `signerDid`. For `requiredApprovals` > 1 — or whenever four-eyes matters — use the
-> DID/identity form, which counts distinct approvers (DIV §4.4.6).
+> one approver whose two registered credentials are both listed satisfies a 2-of-N alone. A signed
+> `requesterCannotApprove` rule requires DID/identity trust; key-list mode is refused.
+> For `requiredApprovals` > 1, use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
 > Delegations name approver identities and are refused outright in key-list mode.
 
 `WEBAUTHN` (passkey) witnesses are verified in full per DIV §4.4.5 — origin and RP ID pinning
@@ -186,52 +200,37 @@ payload, and the ES256 signature over `authenticatorData ‖ SHA-256(clientDataJ
 shared `webauthn-vector.json` golden vector (`tests/test_webauthn.py`). Pass `expected_origin` and
 `expected_rp_id` to enable it.
 
-## DEWP conformance
+## Receipt and audit verification
 
-`intyga_sdk.ledger` implements the **DEWP Core primitives** ([`docs/DEWP.md`](../../docs/DEWP.md) §9.1) —
-domain-separated hashing, two-tier Merkle construction, inclusion proof verification, the
-`trust.intyga.audit.v1` canonical preimage, the `0x03` anchor digest — plus single-bundle verification
-with the §7.1 property model (`verify_bundle`). Parity with the TypeScript reference is locked by the
-shared golden vectors in `packages/mcp-schemas/vectors/ledger-vectors.json`.
+`verify_platform_receipt` and `verify_agent_authority` are exported alongside
+`verify_approval_receipt` and `verify_delegation`. Ledger APIs live in `intyga_sdk.ledger`:
+`verify_bundle`, `verify_evidence_bundle`, `verify_roots_chain`, `verify_anchor_quorum` and
+`verify_anchor_signature`. Existing `verify_bundle(bundle, trusted_root)` calls remain supported;
+pass `anchor_policy`, `resolve_anchor_key` and optionally `anchors`/`external_keys` for anchoring.
 
-Five limits are deliberate and reported honestly rather than silently:
+The five language verifiers support the same receipt and audit verification features, pinned by
+`canonical-vectors.json`, `ledger-vectors.json` and `verifier-parity-vectors.json`:
 
-- **`signature_verified` is always `False`.** Re-verifying the embedded DIV ES256 signature would pull
-  a cryptography dependency into a module that otherwise needs only `hashlib`. A signed event therefore
-  reports `CONTENT_VERIFIED` here where the TypeScript verifier would report `SIGNATURE_VERIFIED` — the
-  commitment result is identical; only the signature claim is withheld.
-- **Anchor quorum verification (§5.3) is not implemented,** so **`anchor_verified` is always `False`
-  and `FULLY_VERIFIED` is not reachable from this port.** §3.7 makes that property conditional on a
-  quorum of distinct trusted issuers signing the same `dailyRoot`; with no quorum check there is
-  nothing to base it on. `verify_anchor_signature` exists, but it is exactly what its name says — a
-  standalone single-anchor ES256 check over the raw 32-byte digest (§5.2, pinned by the shared
-  `signedAnchor` vectors), not quorum and not bundle-level anchor verification, and it is
-  deliberately not wired into `verify_bundle`. A bundle whose commitment and content both verify
-  against an independently supplied root reports `CONTENT_VERIFIED` with `ok: True` and a note
-  explaining the gap. (Until Jul 2026 this port set `anchor_verified` from the mere presence of a
-  trusted root and reported `FULLY_VERIFIED` — a label that asserted more than had been checked.)
-- **The §5.4 checkpoint continuity chain (`0x04` domain tag) is not implemented.** It is TS-only:
-  DEWP §9.1 places it outside the Core primitives this port targets. Use `@intyga/verify` to check
-  a checkpoint chain.
-- **DIV §5b Agent Authority is not implemented** (`div-agent-authority` payloads and the
-  `agentAuthorityPayloads` vector section; TypeScript-only). `verify_approval_receipt`
-  correctly REFUSES the payload type — an authority authorizes no action — this port just cannot
-  verify one as governance evidence.
-- **DIV §5c Platform Hash-Only Intent is not implemented** (`div-platform-intent` payloads and the
-  `platformIntentPayloads` vector section; TypeScript-only). `verify_approval_receipt` correctly
-  REFUSES the payload type (pinned by the `platform-intent-refused-by-approval-verifier` receipt
-  fixture) — §5c requires a separate `verifyPlatformReceipt` entry point — this port just cannot
-  verify one.
+- DIV approval/offline/delegation receipts, agent-authority seals (§5b), and platform receipts (§5c).
+  Platform receipts require WebAuthn and caller-pinned digest, RP, nonce, origin and subject keys.
+  Authority/delegation verification never substitutes for approval of an action.
+- Self-certifying DIDs, with explicit caller key mappings taking precedence.
+- DEWP single-event and multi-event proof bundles: inclusion, canonical content/header binding,
+  embedded ES256 signatures, tenant identity, sequence gaps/duplicates and claimed range endpoints.
+- Checkpoint continuity (§5.4), and anchor quorum (§5.3) under the caller's policy: ES256, Ed25519,
+  RSA-PSS and Rekor SET/payload verification under a separately pinned log key.
 
-`verify_bundle` also refuses any `kind` other than `dewp.audit.inclusion-proof` (§6.5), and declines to
-attempt leaf binding for an Application Profile other than `trust.intyga.audit.v1` (§4.5) rather than
-reporting a mismatch that would read as tampering.
+Trust inputs must come from the caller. A root carried in the bundle proves only internal
+consistency; a producer's `externallyAnchored` flag is a claim, not verification. Bundle-carried
+anchors can count under caller-trusted keys, but only independently fetched, checkpoint-attributed
+anchors may establish divergence. For multi-checkpoint exports, key caller anchors by checkpoint ID
+or root; a flat list cannot establish exact attribution across checkpoints.
 
-For the rest of the surface — signed multi-anchor quorum, evidence bundles with full anchor
-evaluation and the four-property model at strength — use the TypeScript verifier
-(`@intyga/verify`). Note that no implementation, the TypeScript one included, currently claims the
-§9.2 **Extended Profile**: the profile also requires NDJSON evidence streaming (§6.4), which is
-specified but not yet implemented anywhere.
+Limits remain explicit: no NDJSON evidence streaming, no RFC 3161/CMS verification, and no WEBHOOK
+anchor verifier. Those anchors do not count toward quorum. No implementation claims the complete
+DEWP Extended Profile (§9.2). Embedded WebAuthn material is incomplete in the audit leaf; verify the
+full DIV receipt separately. Offline authority verification checks the seal, not subsequent online
+revocation. Verification does not consume a nonce or prove execution.
 
 ## License
 

@@ -5,6 +5,44 @@ All notable changes to `intyga-sdk` (Python) are documented here. The format fol
 
 ## [Unreleased]
 
+- **Wire format: the DIV Intent Payload gained a REQUIRED `evidence` field, and it must be `null`.**
+  `div-intent-verification` and `div-offline-intent` now carry `"evidence":null` in the signed bytes
+  (DIV §4.3.4); `div-delegation`, `div-agent-authority` and `div-platform-intent` deliberately do
+  not. `null` is signed and load-bearing, exactly as `requester.attestation`'s null is: it is the
+  payload's explicit statement that the authorization was not conditioned on any external fact.
+  Verification refuses a payload whose `evidence` key is absent, and refuses any non-`null` value
+  rather than treating it as unconditioned — the same fail-closed-on-unknown rule as the
+  `signerClass` registry, and checked before Local Payload Reconstruction so an unsupported payload
+  shape does not surface as a parameter mismatch. Absent and `null` are distinguished explicitly;
+  collapsing them would make the check a no-op. All golden vectors were regenerated.
+
+- Align cross-language receipt and audit verification: platform receipts, agent-authority seals,
+  self-certifying DID trust, single/multi-event bundles, embedded ES256 signatures, tenant sequence
+  checks, checkpoint continuity, anchor quorum and Rekor. Shared executable fixtures cover valid
+  artifacts and refusals; no wire format changes.
+- Refuse unknown witness signature algorithms. Require identity-bound trust when the signed
+  `requesterCannotApprove` rule is set; key-only trust cannot enforce requester identity.
+- **`verifyRootsChain` range-checks the FIRST entry.** The non-integer and self-inverted seq-range
+  checks were gated on having a predecessor, so the first entry was never range-checked — and a
+  single-entry `roots.jsonl` (a new tenant, or the first day after a truncation) is exactly where
+  the first entry is the only one. Such a file verified clean here while Go and Rust refused it.
+  Only the overlap check is relational now. New `single-entry-inverted-seq-range` and
+  `single-entry-non-integer-seq-range` parity vectors pin it in all five ports.
+
+- **Close approval-flow transport and argument races.** The callable guard now validates and
+  detaches one canonical-JSON snapshot before its first await, then uses that snapshot for the
+  challenge, local receipt verification, nonce consumption and execution. The wrapped function
+  therefore receives JSON types: a tuple arrives as a list and an integral float such as `1.0` as
+  the int `1`. Arguments with no portable JSON form (NaN, `-0.0`, integers outside the portable
+  range) are refused before any challenge is created. Authenticated HTTP
+  requests refuse redirects, so Basic and bearer credentials cannot be forwarded to another
+  origin. `require_approval` now derives the gateway TTL and monotonic local deadline from one
+  duration and cancels authentication/HTTP I/O when that deadline elapses. Transport
+  now uses a per-request HTTPX async client so deadline cancellation closes the connection instead
+  of leaving a blocking urllib read worker. OS DNS resolution can still outlive cancellation and
+  delay `asyncio.run()` shutdown; no hard process-shutdown bound is claimed.
+- `authorize()` now omits `actionType` when it is unset, matching the gateway's optional-field
+  schema, and the manual README flow consumes its verified nonce before executing.
 - **Tokens are re-exchanged before they expire, and once more on a 401.** `IntygaClient` cached
   the first `client_credentials` exchange for the life of the process and never read `expires_in`,
   so a long-lived service (the `require_human_approval` guard holds one client) or a long

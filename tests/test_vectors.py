@@ -506,6 +506,34 @@ class TestTrustAnchor(unittest.TestCase):
         )
         self.assertTrue(res.get("ok"), res.get("reason"))
 
+    def test_cached_delegation_expiry_is_rechecked_when_used(self):
+        case = self.vectors["offlineReceipts"][0]
+        receipt = case["receipt"]
+        payload = json.loads(receipt["canonicalPayload"])
+        signer_did = receipt["signerDid"]
+        expected = {
+            "target": payload["target"], "actionType": payload["actionType"],
+            "params": payload["params"], "nonce": payload["nonce"],
+            "approvers": {"dids": [signer_did], "resolveKey": lambda did: receipt["signerPublicKey"]},
+        }
+        delegation = {
+            "target": payload["target"], "actionType": payload["actionType"], "params": payload["params"],
+            "delegatedTo": [signer_did], "delegatedQuorum": 1, "expiresAt": "2998-12-31T23:59:00Z",
+        }
+        verify = lambda at, **kw: intyga_sdk.verify_approval_receipt(
+            receipt, expected, allow_offline=True, delegation=delegation,
+            as_of=datetime.fromisoformat(at.replace("Z", "+00:00")), **kw)
+        self.assertTrue(verify("2998-12-31T23:58:59Z")["ok"])
+        self.assertTrue(verify("2998-12-31T23:59:30Z")["ok"])
+        expired = verify("2998-12-31T23:59:31Z")
+        self.assertFalse(expired["ok"])
+        self.assertIn("delegation has expired", expired["reason"])
+        self.assertTrue(intyga_sdk.verify_approval_receipt(receipt, expected, allow_offline=True,
+            as_of=datetime.fromisoformat("2998-12-31T23:59:31+00:00"))["ok"])
+        self.assertTrue(verify("2998-12-31T23:59:31Z", allow_expired=True)["ok"])
+        delegation["expiresAt"] = "invalid"
+        self.assertFalse(verify("2998-12-31T23:58:59Z", allow_expired=True)["ok"])
+
     def test_did_mode_refuses_a_signer_outside_the_allowlist(self):
         res = intyga_sdk.verify_approval_receipt(
             self.receipt,

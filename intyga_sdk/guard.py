@@ -25,11 +25,12 @@ Design constraints, stated because they are load-bearing:
 import asyncio
 import functools
 import inspect
+import json
 import warnings
 from typing import Any, Callable, Dict, Optional
 
 from .client import IntygaClient
-from .crypto import verify_approval_receipt
+from .crypto import stable_stringify, verify_approval_receipt
 from .errors import ApprovalRefused
 
 
@@ -89,6 +90,13 @@ def require_human_approval(
                     "CrewAI @tool both call with keywords)"
                 )
 
+        def snapshot_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+            """Validate canonical JSON and detach every nested value before the first await."""
+            snapshot = json.loads(stable_stringify(kwargs))
+            if not isinstance(snapshot, dict):  # stable_stringify(kwargs) should make this impossible
+                raise TypeError("approval-gated keyword arguments must encode as a JSON object")
+            return snapshot
+
         async def approve(kwargs: Dict[str, Any]) -> None:
             result = await client.require_approval(
                 description or f"Execute {resolved_action}",
@@ -145,8 +153,9 @@ def require_human_approval(
             @functools.wraps(fn)
             async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
                 refuse_positional(args)
-                await approve(kwargs)
-                return await fn(**kwargs)
+                approved_kwargs = snapshot_kwargs(kwargs)
+                await approve(approved_kwargs)
+                return await fn(**approved_kwargs)
 
             return async_wrapper
 
@@ -163,8 +172,9 @@ def require_human_approval(
                     "the guard would deadlock blocking on the approval. Make the tool function "
                     "async; the guard awaits it natively."
                 )
-            asyncio.run(approve(kwargs))
-            return fn(**kwargs)
+            approved_kwargs = snapshot_kwargs(kwargs)
+            asyncio.run(approve(approved_kwargs))
+            return fn(**approved_kwargs)
 
         return sync_wrapper
 

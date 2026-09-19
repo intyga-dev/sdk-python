@@ -263,37 +263,21 @@ def anchor_digest_hex(anchor: Dict[str, str]) -> str:
 
 
 def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) -> bool:
-    """Verify ONE anchor's ES256 signature over its raw 32-byte digest (DEWP §5.2).
+    """Verify one ES256, Ed25519 or RSA-PSS anchor under a caller-pinned SPKI key.
 
-    A standalone single-anchor primitive, and exactly that: NOT quorum verification (§5.3), and
-    deliberately not wired into ``verify_bundle`` — ``anchor_verified`` there is conditional on a
-    quorum of distinct trusted issuers (§3.7), which this port does not implement, so it stays
-    ``False`` regardless of what this function returns.
-
-    The signed MESSAGE is the raw 32-byte anchor digest, never its 64-character hex text. ECDSA
-    P-256/SHA-256 hashes the message again internally (so no Prehashed): an implementation that
-    signs the hex matches the digest vector and still fails to interoperate — the §5.2 trap the
-    shared ``signedAnchor`` vectors exist to catch. The signature is base64 DER (the TS producer
-    signs with dsaEncoding "der"); raw 64-byte IEEE-P1363 is also accepted, exactly as in
-    ``crypto.verify_ecdsa_p256``.
-
-    ``public_key_spki_b64`` (base64 DER SPKI) comes from the CALLER's trust policy, never from the
-    anchor itself. The key is pinned to EC P-256 so an anchor labelled ES256 cannot be verified
-    under some other scheme, and any escape is a refusal — a verifier that raises has not returned
-    "invalid", it has crashed.
+    The message is the raw domain-separated digest; quorum is a separate check.
     """
     try:
-        if not isinstance(anchor, dict) or anchor.get("algorithm") != "ES256":
+        if not isinstance(anchor, dict) or anchor.get("algorithm") not in ("ES256", "Ed25519", "RSA-PSS"):
             return False
         signature_b64 = anchor.get("signature")
         if not isinstance(signature_b64, str) or not signature_b64:
             return False
 
-        # Imported here, not at module top: bundle verification deliberately needs only hashlib,
-        # and this primitive is the one place the ledger module touches real crypto.
+        # Import cryptography lazily; hash/proof primitives remain usable without loading it.
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa, padding
         from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
         # base64url as well as standard, matching the rest of this package and `Buffer.from(s,
@@ -304,6 +288,20 @@ def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) ->
         from .crypto import base64_decode_flexible
 
         public_key = serialization.load_der_public_key(base64_decode_flexible(public_key_spki_b64))
+        digest = bytes.fromhex(anchor_digest_hex(anchor))
+        signature = base64_decode_flexible(signature_b64)
+        if anchor["algorithm"] == "Ed25519":
+            if not isinstance(public_key, ed25519.Ed25519PublicKey):
+                return False
+            public_key.verify(signature, digest)
+            return True
+        if anchor["algorithm"] == "RSA-PSS":
+            if not isinstance(public_key, rsa.RSAPublicKey):
+                return False
+            public_key.verify(signature, digest,
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.AUTO),
+                hashes.SHA256())
+            return True
         if not isinstance(public_key, ec.EllipticCurvePublicKey):
             return False
         if not isinstance(public_key.curve, ec.SECP256R1):
@@ -332,12 +330,21 @@ def verify_anchor_signature(anchor: Dict[str, Any], public_key_spki_b64: str) ->
 
 
 # ── Bundle verification with the DEWP §7.1 property model ─────────────────────────────────────────
-def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) -> Dict[str, Any]:
+def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None, *,
+                  anchors=None, anchor_policy=None, resolve_anchor_key=None, external_keys=None) -> Dict[str, Any]:
     """Verify a single inclusion-proof bundle. Returns the four independent properties + summary level.
 
-    `trusted_root` is the daily root obtained from an external anchor; without it, anchorVerified is
-    false (the bundle's own root is self-asserted and not a trustworthy verdict).
+    `trusted_root` is independently obtained. Anchor verification additionally requires the
+    caller's policy and trusted-key resolver; the bundle alone never establishes root provenance.
     """
+    try:
+        return _verify_bundle_checked(bundle, trusted_root, anchors=anchors, anchor_policy=anchor_policy,
+                                      resolve_anchor_key=resolve_anchor_key, external_keys=external_keys)
+    except Exception as exc:
+        return _invalid(f"malformed bundle or verification input ({type(exc).__name__})")
+
+
+def _verify_bundle_checked(bundle, trusted_root, *, anchors, anchor_policy, resolve_anchor_key, external_keys):
     notes: List[str] = []
 
     # Every field below comes from an untrusted artifact. Shape-check before use: a verifier that
@@ -456,26 +463,30 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
     # bundle DID ship. Mirrors `contentBoundWhenPresent` in @intyga/verify ledger-bundle.ts.
     content_bound_when_present = (leaf_binding is True) if canonical is not None else True
 
-    # signatureVerified would re-verify the embedded DIV ES256 signature; kept out of this port to
-    # avoid pulling a crypto dependency into the ledger module (the TS verifier does it). Reporting
-    # False caps a signed event below FULLY_VERIFIED, which is the honest direction.
-    signature_verified = False
-
-    # DEWP §3.7: anchorVerified holds if and only if the root is verified against an anchor QUORUM —
-    # at least `requiredAnchors` distinct trusted issuers signing the SAME dailyRoot. This port
-    # implements no anchor signature check, no quorum and no divergence detection, so it cannot
-    # satisfy that under any argument. It previously set anchorVerified purely because a root was
-    # passed in, which asserted more than was checked. An unverified anchor is not a verified one.
-    anchor_verified = False
-    if commitment_verified and root_source == "independent":
-        notes.append(
-            "an independently supplied root was used, but this port does not verify anchor "
-            "signatures or quorum (DEWP §5.2/§5.3), so anchorVerified stays false and "
-            "FULLY_VERIFIED is not reachable here — use @intyga/verify for anchor quorum"
-        )
+    signature_verified = bool(content_verified and canonical and verify_embedded_signature(canonical))
+    anchor_verified, divergence = False, False
+    if anchor_policy is not None and callable(resolve_anchor_key) and daily_root:
+        candidates = anchors if anchors is not None else [
+            *(bundle.get("anchors") or []), *([bundle["anchor"]] if bundle.get("anchor") else [])]
+        verdict = verify_anchor_quorum(candidates, daily_root, anchor_policy, resolve_anchor_key,
+            divergence_anchors=anchors or [], external_keys=external_keys)
+        anchor_verified = commitment_verified and verdict["ok"]
+        divergence = verdict["divergence"]
+        if divergence:
+            notes.append("ANCHOR DIVERGENCE: " + verdict.get("reason", "conflicting roots"))
+        elif not verdict["ok"]:
+            notes.append(verdict.get("reason", "anchor quorum not met"))
+        else:
+            notes.append("Anchor quorum met under caller policy and keys")
+        if verdict.get("note"):
+            notes.append(verdict["note"])
+    elif anchor_policy is not None:
+        notes.append("Anchor quorum could not be evaluated: a daily root and resolve_anchor_key are required")
+    elif commitment_verified and root_source == "independent":
+        notes.append("An independently supplied root was used, but no anchor quorum policy was supplied; anchorVerified stays false")
 
     # DEWP §6.2 asks verifiers to SURFACE the producer's own quorum claim alongside their verdict.
-    # Reporting it is not trusting it: `anchor_verified` above is the check, and stays False either
+    # Reporting it is not trusting it: `anchor_verified` above is the independent check, not this
     # way. But a reader comparing two exports needs the claim AND the threshold behind it — a
     # deployment requiring one issuer and one requiring three both publish `externallyAnchored: true`,
     # and the boolean alone cannot tell them apart.
@@ -489,7 +500,7 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
         quorum = f"{required} distinct independent issuer(s)" if required else "an unstated quorum"
         notes.append(
             f"producer CLAIMS external anchoring: {claimed} (against {quorum}). Claim only — this "
-            "port evaluates no anchor quorum, so it neither confirms nor refutes it"
+            "claim is separate from the anchorVerified result under the caller policy"
         )
 
     properties = {
@@ -503,7 +514,7 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
         and canonical.get("signature")
         and canonical.get("signerPublicKey")
     )
-    if not commitment_verified:
+    if divergence or not commitment_verified:
         level = "INVALID"
     elif not content_verified:
         level = "COMMITMENT_VERIFIED"
@@ -521,7 +532,10 @@ def verify_bundle(bundle: Dict[str, Any], trusted_root: Optional[str] = None) ->
             and leaf_binding is not False
             and header_binding is not False
             and content_bound_when_present
+            and not divergence
+            and (anchor_policy is None or anchor_verified)
         ),
+        "dailyRoot": daily_root,
         "rootSource": root_source,
         "properties": properties,
         "checks": {"leafBinding": leaf_binding, "headerBinding": header_binding},
@@ -545,3 +559,12 @@ def _invalid(reason: str) -> Dict[str, Any]:
         "verificationLevel": "INVALID",
         "notes": [reason],
     }
+
+
+# Imported after the primitives to keep the public ledger namespace backwards compatible.
+from .ledger_advanced import (
+    EVIDENCE_BUNDLE_KIND, CHAIN_TAG, GENESIS_PREV_CHAIN_HASH,
+    verify_embedded_signature, derive_verification_level,
+    parse_rekor_evidence, rekor_payload_hash_for, verify_rekor_anchor, verify_anchor_quorum,
+    chain_preimage, chain_hash, verify_roots_chain, verify_evidence_bundle,
+)

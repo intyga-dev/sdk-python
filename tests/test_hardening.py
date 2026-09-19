@@ -151,7 +151,7 @@ class TestWitnessCap(unittest.TestCase):
             # so it must match the payload or the receipt is refused before the witness loop.
             "actionDescription": "d",
             "signatures": [
-                {"signerDid": f"did:x:{i}", "signature": "AA", "publicKey": "BB"}
+                {"signerDid": f"did:x:{i}", "signature": "AA", "publicKey": "BB", "sigAlg": "ES256"}
                 for i in range(MAX_WITNESSES + 1)
             ],
         }
@@ -209,7 +209,7 @@ class TestDelegationWitnessCap(unittest.TestCase):
             # so it must match the payload or the receipt is refused before the witness loop.
             "actionDescription": "d",
             "signatures": [
-                {"signerDid": f"did:x:{i}", "signature": "AA", "publicKey": "BB"}
+                {"signerDid": f"did:x:{i}", "signature": "AA", "publicKey": "BB", "sigAlg": "ES256"}
                 for i in range(witness_count)
             ],
         }

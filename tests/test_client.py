@@ -1,16 +1,16 @@
 """Client contract tests: the nonce merge in require_approval and the typed error split.
 
-Transport is stubbed at intyga_sdk.client._async_request / urllib, so these run offline.
+Transport is stubbed at intyga_sdk.client._async_request / HTTPX, so these run offline.
 """
 
 import asyncio
 import json
 import unittest
-import urllib.error
 from unittest import mock
 
+import httpx
 import intyga_sdk.client as client_mod
-from intyga_sdk.client import IntygaClient, _sync_request
+from intyga_sdk.client import IntygaClient
 from intyga_sdk.errors import GatewayRefused, GatewayUnreachable
 
 
@@ -65,12 +65,19 @@ class TestTypedErrors(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, GatewayUnreachable)
 
     def test_transport_failure_raises_gateway_unreachable(self):
-        def fake_urlopen(req):
-            raise urllib.error.URLError("connection refused")
+        class RefusingClient:
+            async def __aenter__(self):
+                return self
 
-        with mock.patch.object(client_mod.urllib.request, "urlopen", fake_urlopen):
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def request(self, method, url, headers=None, json=None):
+                raise httpx.ConnectError("connection refused")
+
+        with mock.patch.object(client_mod.httpx, "AsyncClient", return_value=RefusingClient()):
             with self.assertRaises(GatewayUnreachable):
-                _sync_request("https://gw.example/authorize", method="POST")
+                asyncio.run(client_mod._async_request("https://gw.example/authorize", method="POST"))
 
 
 if __name__ == "__main__":

@@ -1,13 +1,15 @@
 import asyncio
 import base64
+import contextvars
 import json
 import math
+import ssl
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+import httpx
 
 from .errors import GatewayRefused, GatewayUnreachable
 
@@ -15,6 +17,19 @@ from .errors import GatewayRefused, GatewayUnreachable
 # advertised in `expires_in`; past it the client re-exchanges BEFORE the token can 401 mid-poll.
 # The margin is min(60 s, expires_in / 10), so a short-lived token is not re-exchanged on every call.
 _REFRESH_MARGIN_MAX_SECONDS = 60.0
+_DEFAULT_APPROVAL_TIMEOUT_MS = 120_000
+
+# Set only around require_approval(), so token exchange and every authenticated request share one
+# total monotonic deadline without adding a second, independently drifting timeout parameter to
+# each public method.
+_request_deadline: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "intyga_request_deadline", default=None
+)
+
+
+def _monotonic() -> float:
+    """Clock seam for deterministic deadline tests; production always uses the monotonic clock."""
+    return time.monotonic()
 
 _STORED_CREDENTIAL_EXPIRED = (
     "the stored credential from `intyga login` has expired and cannot be refreshed by the SDK "
@@ -74,26 +89,39 @@ def _load_stored_token(gateway_url: str) -> Optional[str]:
         pass
     return None
 
-def _sync_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
-    headers = headers or {}
-    req = urllib.request.Request(url, method=method, headers=headers)
-    if json_body is not None:
-        req.data = json.dumps(json_body).encode("utf-8")
-        req.add_header("content-type", "application/json")
-    try:
-        with urllib.request.urlopen(req) as response:
-            return response.status, response.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8")
-        except Exception:
-            body = ""
-        return e.code, body
-    except urllib.error.URLError as e:
-        raise GatewayUnreachable(f"Connection failed: {e.reason}")
+def _remaining_request_seconds() -> Optional[float]:
+    deadline = _request_deadline.get()
+    if deadline is None:
+        return None
+    return max(0.001, deadline - _monotonic())
+
 
 async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
-    return await asyncio.to_thread(_sync_request, url, method, headers, json_body)
+    remaining = _remaining_request_seconds()
+
+    async def request() -> tuple[int, str]:
+        # A client is scoped to this request because callers may use separate asyncio.run() loops.
+        # The explicit SSLContext preserves the operating system trust store used by urllib.
+        async with httpx.AsyncClient(
+            follow_redirects=False,
+            timeout=remaining,
+            verify=ssl.create_default_context(),
+        ) as client:
+            response = await client.request(method, url, headers=headers, json=json_body)
+            return response.status_code, response.text
+
+    try:
+        if remaining is None:
+            return await request()
+        # HTTPX timeouts bound inactivity per operation. wait_for additionally bounds the complete
+        # request and body read when a peer sends a byte often enough to evade a read timeout.
+        # OS DNS resolution can outlive cancellation and delay asyncio.run() executor shutdown;
+        # this deadline governs approval acceptance and cancellable HTTP I/O, not process shutdown.
+        return await asyncio.wait_for(request(), timeout=remaining)
+    except asyncio.TimeoutError as e:
+        raise GatewayUnreachable("Connection failed: approval deadline elapsed") from e
+    except httpx.RequestError as e:
+        raise GatewayUnreachable(f"Connection failed: {e}") from e
 
 class IntygaClient:
     def __init__(
@@ -150,7 +178,7 @@ class IntygaClient:
     def _cache_is_fresh(self) -> bool:
         if self._cached_expires_at is None:
             return True
-        return time.monotonic() < self._cached_expires_at - self._cached_margin
+        return _monotonic() < self._cached_expires_at - self._cached_margin
 
     async def token(self) -> str:
         """Resolve a bearer token: the provided one, a still-fresh cached one, a stored `intyga login`
@@ -178,7 +206,7 @@ class IntygaClient:
                         raise GatewayRefused(401, _STORED_CREDENTIAL_EXPIRED)
                     # Wall-clock `exp` mapped onto the monotonic clock; margin 0 because there is
                     # nothing to renew it with, so it is served for its whole remaining life.
-                    self._cached_expires_at = time.monotonic() + remaining
+                    self._cached_expires_at = _monotonic() + remaining
                 self._cached_token = stored
                 self._cached_source = "stored"
                 return stored
@@ -210,7 +238,7 @@ class IntygaClient:
         self._cached_token = access_token
         self._cached_source = "exchange"
         if expires_in is not None:
-            self._cached_expires_at = time.monotonic() + expires_in
+            self._cached_expires_at = _monotonic() + expires_in
             self._cached_margin = _refresh_margin(expires_in)
         return access_token
 
@@ -259,9 +287,10 @@ class IntygaClient:
         payload = {
             "target": self._resolve_target(target),
             "actionDescription": action_description,
-            "actionType": action_type,
             "params": params if params is not None else {},
         }
+        if action_type is not None:
+            payload["actionType"] = action_type
         if timeout is not None:
             payload["timeout"] = timeout
 
@@ -309,33 +338,63 @@ class IntygaClient:
         target: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a challenge and block until approved, denied, or expired."""
-        backend_timeout_sec = math.ceil(timeout_ms / 1000) if timeout_ms is not None else timeout
-
-        # `target` must be forwarded, not dropped. The Go and Rust ports rebuilt their options
-        # struct here field-by-field and lost it on exactly this path — the one most callers use.
-        auth_res = await self.authorize(
-            action_description=action_description,
-            action_type=action_type,
-            params=params,
-            timeout=backend_timeout_sec,
-            target=target,
+        resolved_timeout_ms = (
+            timeout_ms
+            if timeout_ms is not None
+            else timeout * 1000 if timeout is not None
+            else _DEFAULT_APPROVAL_TIMEOUT_MS
         )
-        nonce = auth_res["nonce"]
+        if (
+            isinstance(resolved_timeout_ms, bool)
+            or not isinstance(resolved_timeout_ms, (int, float))
+            or not math.isfinite(resolved_timeout_ms)
+            or resolved_timeout_ms <= 0
+        ):
+            raise ValueError("timeout must be a finite number greater than zero")
+        backend_timeout_sec = math.ceil(resolved_timeout_ms / 1000)
+        deadline = _monotonic() + (resolved_timeout_ms / 1000)
+        resolved_interval_ms = interval_ms if interval_ms is not None else 2_000
+        if (
+            isinstance(resolved_interval_ms, bool)
+            or not isinstance(resolved_interval_ms, (int, float))
+            or not math.isfinite(resolved_interval_ms)
+            or resolved_interval_ms <= 0
+        ):
+            raise ValueError("interval_ms must be a finite number greater than zero")
+        interval_sec = resolved_interval_ms / 1000
+        deadline_token = _request_deadline.set(deadline)
+        try:
+            # `target` must be forwarded, not dropped. The Go and Rust ports rebuilt their options
+            # struct here field-by-field and lost it on exactly this path — the one most callers use.
+            auth_res = await self.authorize(
+                action_description=action_description,
+                action_type=action_type,
+                params=params,
+                timeout=backend_timeout_sec,
+                target=target,
+            )
+            nonce = auth_res["nonce"]
 
-        deadline = (time.time() * 1000) + (timeout_ms if timeout_ms is not None else 120000)
-        interval_sec = (interval_ms / 1000) if interval_ms is not None else 2.0
-
-        # The nonce is merged into every return, terminal and expired alike — it is the challenge
-        # this result belongs to, and without it the one-shot helper's caller cannot pass
-        # `expected["nonce"]` to verify_approval_receipt or record redemption for their own
-        # single-use check. Matches @intyga/sdk, sdk-go and sdk-rust, which all set it.
-        while True:
-            r = await self.status(nonce)
-            if r.get("status") != "PENDING":
-                return {**r, "nonce": nonce}
-            if (time.time() * 1000) > deadline:
-                return {"status": "EXPIRED", "nonce": nonce}
-            await asyncio.sleep(interval_sec)
+            # The nonce is merged into every return, terminal and expired alike — it is the challenge
+            # this result belongs to, and without it the one-shot helper's caller cannot pass
+            # `expected["nonce"]` to verify_approval_receipt or record redemption for their own
+            # single-use check. Matches @intyga/sdk, sdk-go and sdk-rust, which all set it.
+            while True:
+                if _monotonic() >= deadline:
+                    return {"status": "EXPIRED", "nonce": nonce}
+                r = await self.status(nonce)
+                # The response is useful only if it arrived inside this relying party's wait
+                # window. Recheck after the await before accepting even an APPROVED status.
+                if _monotonic() >= deadline:
+                    return {"status": "EXPIRED", "nonce": nonce}
+                if r.get("status") != "PENDING":
+                    return {**r, "nonce": nonce}
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    return {"status": "EXPIRED", "nonce": nonce}
+                await asyncio.sleep(min(interval_sec, remaining))
+        finally:
+            _request_deadline.reset(deadline_token)
 
     async def verify(self, document_hash: str) -> Dict[str, Any]:
         """Lookup a signed document witness by hash."""

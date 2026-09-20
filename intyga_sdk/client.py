@@ -282,6 +282,7 @@ class IntygaClient:
         params: Optional[Dict[str, Any]] = None,
         timeout: Optional[int] = None,
         target: Optional[str] = None,
+        agent_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Request action authorization (creates a challenge)."""
         payload = {
@@ -293,6 +294,8 @@ class IntygaClient:
             payload["actionType"] = action_type
         if timeout is not None:
             payload["timeout"] = timeout
+        if agent_context is not None:
+            payload["agentContext"] = agent_context
 
         return await self._request_authed(
             "authorize", f"{self._gateway_url}/authorize", method="POST", json_body=payload
@@ -336,6 +339,7 @@ class IntygaClient:
         timeout_ms: Optional[int] = None,
         interval_ms: Optional[int] = None,
         target: Optional[str] = None,
+        agent_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a challenge and block until approved, denied, or expired."""
         resolved_timeout_ms = (
@@ -372,6 +376,7 @@ class IntygaClient:
                 params=params,
                 timeout=backend_timeout_sec,
                 target=target,
+                agent_context=agent_context,
             )
             nonce = auth_res["nonce"]
 

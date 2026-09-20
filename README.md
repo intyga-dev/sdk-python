@@ -16,6 +16,10 @@ pip install intyga-sdk
 `target` is required — it names THIS execution environment, so the approval cannot be replayed
 against a different service (DIV Target Isolation). Issue the challenge with `authorize()` so you
 own the `nonce`: verification needs it, and it is what lets you enforce single-use yourself.
+The example below is for a human or `SERVICE` key. With an `AI_AGENT` key, pass
+`agent_context` to `authorize()` and an independently retained `agentContext` to the verifier.
+The executing PEP must recalculate the digest from its live model, tools and prompt and maintain
+an atomic session head and budget across sessions (DIV §4.3.6).
 
 ```python
 import asyncio

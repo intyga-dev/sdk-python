@@ -83,6 +83,17 @@ class TestGoldenVectors(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
+    def test_agent_intent_payloads(self):
+        for case in self.vectors.get("agentIntentPayloads", []):
+            inp = case["input"]
+            self.assertEqual(intyga_sdk.canonical_intent_payload(
+                target=inp["target"], action_type=inp["actionType"],
+                display=inp["actionDescription"], params=inp["params"],
+                requester=inp["requester"], requirement=inp["requirement"],
+                nonce=inp["nonce"], expires_at=inp["expiresAt"],
+                agent_context=inp["agentContext"],
+            ), case["expected"])
+
     def test_offline_intent_payloads(self):
         # Offline approval shares the intent payload's canonicalization contract and adds
         # `challengedAt`. The two kinds must never produce the same bytes: if they did, an out-of-band

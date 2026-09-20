@@ -5,6 +5,8 @@ All notable changes to `intyga-sdk` (Python) are documented here. The format fol
 
 ## [Unreleased]
 
+- **Wire format: DIV v1 agent intents now sign `action`, `agent`, `session`, `nbf`, and `exp` instead of ordinary `expiresAt`; `div-agent-authority` requires `parentReceiptHash` (null for a root).** Older §5b seals lacking that key cannot verify under this pre-release profile and must be re-sealed. All canonical producers, five verifier ports and vectors must move together; the ordinary HUMAN/SERVICE intent keeps `expiresAt`.
+
 - **Wire format: the DIV Intent Payload gained a REQUIRED `evidence` field, and it must be `null`.**
   `div-intent-verification` and `div-offline-intent` now carry `"evidence":null` in the signed bytes
   (DIV §4.3.4); `div-delegation`, `div-agent-authority` and `div-platform-intent` deliberately do

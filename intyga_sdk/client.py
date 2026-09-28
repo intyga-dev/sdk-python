@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextvars
+import ipaddress
 import json
 import math
 import ssl
@@ -98,6 +99,7 @@ def _remaining_request_seconds() -> Optional[float]:
 
 async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
     remaining = _remaining_request_seconds()
+    remaining = 30.0 if remaining is None else min(30.0, remaining)
 
     async def request() -> tuple[int, str]:
         # A client is scoped to this request because callers may use separate asyncio.run() loops.
@@ -111,17 +113,54 @@ async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[s
             return response.status_code, response.text
 
     try:
-        if remaining is None:
-            return await request()
         # HTTPX timeouts bound inactivity per operation. wait_for additionally bounds the complete
         # request and body read when a peer sends a byte often enough to evade a read timeout.
         # OS DNS resolution can outlive cancellation and delay asyncio.run() executor shutdown;
         # this deadline governs approval acceptance and cancellable HTTP I/O, not process shutdown.
         return await asyncio.wait_for(request(), timeout=remaining)
     except asyncio.TimeoutError as e:
-        raise GatewayUnreachable("Connection failed: approval deadline elapsed") from e
+        raise GatewayUnreachable("Connection failed: request deadline elapsed") from e
     except httpx.RequestError as e:
         raise GatewayUnreachable(f"Connection failed: {e}") from e
+
+def _require_secure_gateway_url(gateway_url: str) -> str:
+    """Return `gateway_url` without trailing slashes, or raise ValueError unless it is https:// or
+    http:// to a loopback host (localhost, 127.0.0.0/8, ::1) for local development. Every request
+    carries a bearer token or client secret, so plain http anywhere else would hand it to any on-path
+    observer. The same rule every Intyga client applies (TypeScript, Go, Rust, Java): change them
+    together."""
+    if not isinstance(gateway_url, str):
+        raise ValueError("gateway_url must be a string")
+    try:
+        parts = urllib.parse.urlsplit(gateway_url)
+        host = parts.hostname  # lowercased, IPv6 brackets stripped
+    except ValueError as e:
+        raise ValueError(f"gateway_url is not a valid URL: {gateway_url!r}") from e
+    if not parts.scheme or not host:
+        raise ValueError(f"gateway_url is not a valid absolute URL: {gateway_url!r}")
+    scheme = parts.scheme.lower()
+    if scheme == "https" or (scheme == "http" and _is_loopback_host(host, parts.netloc)):
+        return gateway_url.rstrip("/")
+    raise ValueError(
+        f"gateway_url must use https:// (got {parts.scheme}://{parts.netloc.rpartition('@')[2]}): "
+        "Intyga clients send credentials on every request and refuse plain http except to a "
+        "loopback host (localhost, 127.0.0.0/8, ::1) for local development"
+    )
+
+
+def _is_loopback_host(host: str, netloc: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address):
+        # Only the bracketed literal [::1]; an IPv4-mapped form is not accepted, matching the ports.
+        return addr == ipaddress.IPv6Address("::1") and "[" in netloc
+    # A dotted quad only (ip_address already refuses "127.1"-style shorthand).
+    return addr in ipaddress.IPv4Network("127.0.0.0/8")
+
 
 class IntygaClient:
     def __init__(
@@ -144,8 +183,12 @@ class IntygaClient:
         and is intended for CLI tools, matching @intyga/sdk. Reading it unconditionally meant a
         service constructed with no credentials — which should raise — silently assumed whatever
         principal a human's `intyga login` had left in that account's home directory.
+
+        `gateway_url` must be https://; http:// is accepted only for a loopback host (localhost,
+        127.0.0.0/8, ::1) for local development. Anything else raises ValueError here, before any
+        credential is sent.
         """
-        self._gateway_url = gateway_url.rstrip("/")
+        self._gateway_url = _require_secure_gateway_url(gateway_url)
         self._token = token
         self._client_id = client_id
         self._client_secret = client_secret
@@ -327,7 +370,7 @@ class IntygaClient:
     async def status(self, nonce: str) -> Dict[str, Any]:
         """Poll a challenge's current status (non-blocking)."""
         return await self._request_authed(
-            "status", f"{self._gateway_url}/authorize/{urllib.parse.quote(nonce)}", method="GET"
+            "status", f"{self._gateway_url}/authorize/{urllib.parse.quote(nonce, safe='')}", method="GET"
         )
 
     async def require_approval(
@@ -379,6 +422,7 @@ class IntygaClient:
                 agent_context=agent_context,
             )
             nonce = auth_res["nonce"]
+            context = {"agentContext": auth_res["agentContext"]} if "agentContext" in auth_res else {}
 
             # The nonce is merged into every return, terminal and expired alike — it is the challenge
             # this result belongs to, and without it the one-shot helper's caller cannot pass
@@ -386,17 +430,17 @@ class IntygaClient:
             # single-use check. Matches @intyga/sdk, sdk-go and sdk-rust, which all set it.
             while True:
                 if _monotonic() >= deadline:
-                    return {"status": "EXPIRED", "nonce": nonce}
+                    return {"status": "EXPIRED", "nonce": nonce, **context}
                 r = await self.status(nonce)
                 # The response is useful only if it arrived inside this relying party's wait
                 # window. Recheck after the await before accepting even an APPROVED status.
                 if _monotonic() >= deadline:
-                    return {"status": "EXPIRED", "nonce": nonce}
+                    return {"status": "EXPIRED", "nonce": nonce, **context}
                 if r.get("status") != "PENDING":
-                    return {**r, "nonce": nonce}
+                    return {**r, "nonce": nonce, **context}
                 remaining = deadline - _monotonic()
                 if remaining <= 0:
-                    return {"status": "EXPIRED", "nonce": nonce}
+                    return {"status": "EXPIRED", "nonce": nonce, **context}
                 await asyncio.sleep(min(interval_sec, remaining))
         finally:
             _request_deadline.reset(deadline_token)
@@ -404,7 +448,7 @@ class IntygaClient:
     async def verify(self, document_hash: str) -> Dict[str, Any]:
         """Lookup a signed document witness by hash."""
         status, body = await _async_request(
-            f"{self._gateway_url}/verify/{urllib.parse.quote(document_hash)}",
+            f"{self._gateway_url}/verify/{urllib.parse.quote(document_hash, safe='')}",
             method="GET"
         )
         if status < 200 or status >= 300:

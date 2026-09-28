@@ -20,6 +20,9 @@ The example below is for a human or `SERVICE` key. With an `AI_AGENT` key, pass
 `agent_context` to `authorize()` and an independently retained `agentContext` to the verifier.
 The executing PEP must recalculate the digest from its live model, tools and prompt and maintain
 an atomic session head and budget across sessions (DIV §4.3.6).
+`gateway_url` must be `https://`: the constructor raises `ValueError` for plain `http://` except to
+a loopback host (`localhost`, `127.0.0.0/8`, `::1`) for local development, and redirects are never
+followed.
 
 ```python
 import asyncio
@@ -191,12 +194,22 @@ origin and RP ID of the approval console the human signs in, i.e. your deploymen
 them: an assertion harvested at any other relying party would otherwise verify. Raw-key (ES256)
 receipts carry no assertion, so the two values are simply unused there.
 
-> **Quorum caveat.** The trust anchor accepts either a flat public-key allowlist or a DID/identity
-> form. In key-list mode the identity IS the key, so an M-of-N quorum counts credentials, not people:
-> one approver whose two registered credentials are both listed satisfies a 2-of-N alone. A signed
-> `requesterCannotApprove` rule requires DID/identity trust; key-list mode is refused.
-> For `requiredApprovals` > 1, use the DID/identity form, which counts distinct approvers (DIV §4.4.6).
-> Delegations name approver identities and are refused outright in key-list mode.
+**Quorum trust.** Key-only trust is accepted only for a one-approval requirement without
+`requesterCannotApprove`. Multi-approver quorums and separation of duties require a DID/identity
+anchor and otherwise fail closed (DIV §5 step 3b). Several credentials for one DID count as one
+approver. Delegations require identity trust regardless of quorum size.
+
+**Requirement floor (DIV §5 step 3d).** The signed `requirement` is the signers' own statement: its
+signature stops a third party from altering it, not the approvers it constrains from writing a weaker
+one. One approver who is also the requester can sign a 1-of-1 payload alone. **Without a floor this
+verifier proves only the quorum the signers stated.** When you know the rule, add it to the
+expectation: `expected["requirement"] = {"requiredApprovals": 3, "requesterCannotApprove": True}`
+(`requireHardwareKey` too, if required). Omitting it keeps the previous behaviour.
+A signed requirement weaker on any field — fewer approvals, no four-eyes or no hardware key where the
+floor demands one — is refused before any signature is counted, with a reason starting "signed
+requirement is weaker than the relying party's policy"; an equal or stricter one passes. A malformed
+floor (quorum below 1) is refused rather than ignored. The same field exists on the delegation
+expectation (pass the ordinary rule) and the agent-authority expectation (your sealing policy).
 
 `WEBAUTHN` (passkey) witnesses are verified in full per DIV §4.4.5 — origin and RP ID pinning
 (fail-closed when unset), user-presence/user-verification flags, challenge binding to the canonical
@@ -229,8 +242,19 @@ consistency; a producer's `externallyAnchored` flag is a claim, not verification
 anchors can count under caller-trusted keys, but only independently fetched, checkpoint-attributed
 anchors may establish divergence. For multi-checkpoint exports, key caller anchors by checkpoint ID
 or root; a flat list cannot establish exact attribution across checkpoints.
+When a policy trusts more than one issuer, scope a Rekor key with `external_keys["rekor_issuer"]`;
+an unscoped legacy Rekor key is accepted only for a single trusted issuer. This prevents one log key
+from authenticating several producer-selected issuer labels into separate quorum slots.
 
-Limits remain explicit: no NDJSON evidence streaming, no RFC 3161/CMS verification, and no WEBHOOK
+RFC 3161 anchors can be checked with `verify_rfc3161_anchor(anchor, trust)` and count toward quorum
+when `external_keys={"rfc3161": {issuer: trust}}` is supplied. This optional adapter invokes an
+installed OpenSSL 3 executable without network access. Trust pins the CA and TSA certificate digest;
+`revocation` must explicitly be `"crl"` with an offline CRL or `"unchecked"`. The caller may select
+an integer `verification_time`; the default rounds the current time up by at most one second so a
+fresh fractional timestamp is not spuriously rejected. Historical verification proves certificate
+validity at issuance but cannot reconstruct historical revocation state.
+
+Limits remain explicit: no NDJSON evidence streaming and no WEBHOOK
 anchor verifier. Those anchors do not count toward quorum. No implementation claims the complete
 DEWP Extended Profile (§9.2). Embedded WebAuthn material is incomplete in the audit leaf; verify the
 full DIV receipt separately. Offline authority verification checks the seal, not subsequent online

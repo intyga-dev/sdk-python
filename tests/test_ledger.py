@@ -116,6 +116,7 @@ class TestLedgerVectors(unittest.TestCase):
     def test_verify_bundle_property_model(self):
         inc = self.v["inclusion"]
         bundle = {
+            "version": 1,
             "kind": "dewp.audit.inclusion-proof",
             "event": {"canonical": inc["leafRow"]},
             "proof": {
@@ -141,7 +142,8 @@ class TestLedgerVectors(unittest.TestCase):
         self.assertTrue(res["properties"]["contentVerified"])
         self.assertFalse(res["properties"]["anchorVerified"])
         self.assertEqual(res["verificationLevel"], "CONTENT_VERIFIED")
-        self.assertEqual(res["rootSource"], "independent")
+        # The verifier cannot tell where a supplied root came from, so it never calls it "independent".
+        self.assertEqual(res["rootSource"], "caller-supplied")
         self.assertTrue(res["ok"])
         self.assertTrue(any("quorum" in n for n in res["notes"]))
 
@@ -168,6 +170,7 @@ class ProducerAnchorClaimTest(unittest.TestCase):
     def _bundle(self, **extra):
         leaf = "a" * 64
         bundle = {
+            "version": 1,
             "kind": "dewp.audit.inclusion-proof",
             "proof": {
                 "leaf": leaf,
@@ -221,6 +224,7 @@ class BundleRootSelectionTest(unittest.TestCase):
     def _bundle(self, **over):
         inc = self.v["inclusion"]
         bundle = {
+            "version": 1,
             "kind": ledger.BUNDLE_KIND,
             "event": {"canonical": inc["leafRow"]},
             "proof": {
@@ -278,6 +282,7 @@ class RedactedBundleTest(unittest.TestCase):
     def _bundle(self, **over):
         inc = self.v["inclusion"]
         bundle = {
+            "version": 1,
             "kind": ledger.BUNDLE_KIND,
             "event": {"canonical": inc["leafRow"]},
             "proof": {

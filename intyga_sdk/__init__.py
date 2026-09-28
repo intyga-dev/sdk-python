@@ -2,6 +2,7 @@ from . import ledger
 from .client import IntygaClient
 from .errors import ApprovalRefused, GatewayRefused, GatewayUnreachable, IntygaError
 from .guard import require_human_approval
+from .rfc3161 import verify_rfc3161_anchor
 from .crypto import (
     stable_stringify,
     canonical_challenge_payload,
@@ -21,6 +22,7 @@ from .crypto import (
     verify_agent_authority,
     verify_platform_receipt,
     self_certifying_did,
+    WEAKER_REQUIREMENT_REASON,
     PolicyCrypto as policy,
 )
 
@@ -31,6 +33,7 @@ __all__ = [
     "GatewayUnreachable",
     "ApprovalRefused",
     "require_human_approval",
+    "verify_rfc3161_anchor",
     "stable_stringify",
     "canonical_challenge_payload",
     "canonical_delegation_payload",
@@ -49,6 +52,7 @@ __all__ = [
     "verify_agent_authority",
     "verify_platform_receipt",
     "self_certifying_did",
+    "WEAKER_REQUIREMENT_REASON",
     "policy",
     "ledger",
 ]

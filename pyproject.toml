@@ -8,12 +8,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "intyga-sdk"
 version = "1.0.0"
-description = "Intyga SDK — require a cryptographically-signed human approval for any high-risk action, and verify the receipt offline"
+description = "INTYGA SDK — require a cryptographically-signed human approval for any high-risk action, and verify the receipt offline"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{ name = "Intyga" }]
+authors = [{ name = "INTYGA" }]
 keywords = ["authorization", "human-approval", "webauthn", "passkey", "audit", "receipts", "ai-agents"]
 classifiers = [
     "Programming Language :: Python :: 3",

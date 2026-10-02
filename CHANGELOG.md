@@ -5,6 +5,11 @@ All notable changes to `intyga-sdk` (Python) are documented here. The format fol
 
 ## [Unreleased]
 
+## [1.0.0]
+
+- Packaging: sdists include the changelog, tests and shared vectors so the source distribution can
+  run its receipt-verification tests outside the monorepo.
+
 - Verify profile-carried WebAuthn audit signatures with caller-trusted signer keys, origin and RP ID.
   Report explicit per-event signature status and key trust; add strict signature acceptance for
   single and bulk evidence. Audit signature checks do not replace full approval-receipt verification.
@@ -173,7 +178,6 @@ All notable changes to `intyga-sdk` (Python) are documented here. The format fol
 - **Security (I11):** `IntygaClient` raises `ValueError` for a `gateway_url` that is not `https://`,
   except `http://` to a loopback host (`localhost`, `127.0.0.0/8`, `::1`) for local development.
 
-## [1.0.0]
 
 Initial public release.
 

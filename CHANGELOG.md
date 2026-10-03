@@ -5,6 +5,11 @@ All notable changes to `intyga-sdk` (Python) are documented here. The format fol
 
 ## [Unreleased]
 
+## [1.1.0]
+
+- No code change. The matched set moves together (`pnpm test:versions`); this release carries the
+  new `@intyga/sdk` CLI options and the `require-approval` Action update.
+
 ## [1.0.0]
 
 - Packaging: sdists include the changelog, tests and shared vectors so the source distribution can

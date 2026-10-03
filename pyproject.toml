@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "intyga-sdk"
-version = "1.0.0"
+version = "1.1.0"
 description = "INTYGA SDK — require a cryptographically-signed human approval for any high-risk action, and verify the receipt offline"
 readme = "README.md"
 requires-python = ">=3.9"

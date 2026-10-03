@@ -4,9 +4,6 @@ One SDK for every INTYGA use case, implemented in Python.
 
 ## Installation
 
-> Status: **not yet published** to PyPI. Until then, install from a checkout of this directory:
-> `pip install -e .`
-
 ```bash
 pip install intyga-sdk
 ```

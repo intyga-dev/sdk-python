@@ -1,5 +1,7 @@
 # intyga-sdk — Universal Governance for Automated Operations (Python)
 
+[![Release gated by INTYGA](https://www.intyga.com/badges/release-gated-by-intyga.svg)](https://www.intyga.com/use-cases/package-publishing)
+
 One SDK for every INTYGA use case, implemented in Python.
 
 ## Installation

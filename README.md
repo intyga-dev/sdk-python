@@ -171,11 +171,75 @@ Everything the SDK raises deliberately subclasses `IntygaError`:
 
 - `GatewayRefused` (with `.status`) — the gateway **answered** and the answer was no: for example a
   403 policy refusal or 401/429. A verdict, not an outage. (Usage no longer produces 402.)
-- `GatewayUnreachable` — transport failure: the gateway could not be asked at all.
+- `GatewayUnreachable` — transport failure: no response arrived (connect, TLS, or a timeout before
+  the response headers). The gateway could not be asked at all.
+- `GatewayResponseUnreadable` (with `.status`) — the gateway answered, but its response body could
+  not be read. Neither an outage nor a verdict, and never routed to the offline fallback.
 - `ApprovalRefused` (with `.status`: `DENIED`, `EXPIRED`, …) — a guarded call was not approved.
+- `OfflineApprovalFailed` (with `.reason`) — the gateway could not be asked, the call opted in to
+  offline approval, and the offline ceremony did not complete (see below).
 
 The refusal/outage split is load-bearing (DIV §5a): a policy denial must never be handled as
 unreachability.
+
+## Offline approval (DIV §5a)
+
+When the gateway cannot be reached, a relying party can still collect the same human quorum, out of
+band: it builds the challenge itself from a gateway-signed **trust bundle** exported in advance
+(`intyga trust-bundle export`), the approvers sign it on a disconnected device, and the ordinary
+verifier checks the result. The approval happens at incident time; nothing is pre-signed. The bundle
+directory (`trust-bundle.jws`, `gateway-key.jwk.json`, `.redeemed/`, `.pending/`) has the same layout
+in every INTYGA SDK, so tools in different languages can share it, and the behaviour is pinned by the
+shared `offline-approval-vectors.json` conformance suite (`tests/test_offline_approval_vectors.py`).
+
+Opt in per call:
+
+```python
+from intyga_sdk import OfflineApprovalOptions
+
+async def collect(challenge):
+    # Show challenge["display"], challenge["params"] and challenge["verificationCode"]; get
+    # challenge["envelope"] ("DIV1:…") to the approvers by QR or copy-paste, and return their
+    # "SIG1:…" replies. May be sync or async.
+    ...
+
+async def restart_primary():
+    r = await intyga.require_approval(
+        "Restart the primary database",
+        target="prod-db-cluster-01",
+        action_type="db.restart",
+        params={"cluster": "primary"},
+        offline=OfflineApprovalOptions(
+            bundle_dir="/etc/myservice/intyga",
+            requester_did="did:intyga:service:oncall",
+            collect_signatures=collect,
+        ),
+    )
+    if r["status"] not in ("APPROVED", "OFFLINE_APPROVED"):
+        raise Exception(f"Not authorized: {r['status']}")
+```
+
+- **Only when the gateway could not be asked:** a transport failure or timeout, a 5xx, or five
+  consecutive polling failures. A 4xx, `DENIED` or `EXPIRED` is never routed offline, and neither is
+  an `agent_context` request. Without `offline=` the transport error is raised as before.
+- **A distinct status.** A completed fallback returns `OFFLINE_APPROVED` with the `receipt` and
+  `nonce`, never `APPROVED`, so an existing `status != "APPROVED"` guard permits nothing new. The
+  receipt has already been verified against the bundle, and its nonce redeemed, before it is returned.
+- **Policy from the bundle.** The quorum and eligible approvers come from the signed bundle (exact
+  action ID; `*` only when the bundle says `BASELINE`). Hardware-key and authenticator-allowlist rules
+  are refused, since a bare offline key cannot meet them. A bundle older than 30 days is refused.
+- **Single use and reconciliation.** The nonce is claimed with an exclusive create in `.redeemed/`,
+  and a record is buffered in `.pending/`. Call `await intyga.reconcile_offline_approvals(bundle_dir)`
+  when connectivity returns; a record is cleared only on a 2xx.
+
+The building blocks are exported too: `verify_trust_bundle`, `save_trust_bundle`/`load_trust_bundle`,
+`approver_anchor`, `requirement_for`, `parse_trust_anchor_file`, `create_offline_challenge`,
+`decode_challenge_envelope`, `encode_signature_envelope`/`decode_signature_envelope`,
+`assemble_offline_receipt`, `FileRedemptionStore`, `use_offline_approval`, `pending_approvals` and
+`clear_pending_approval`. On the approver's side, `sign_challenge_envelope(envelope, private_key=...,
+signer_did=...)` signs a `DIV1:` challenge with an offline P-256 key and returns the `SIG1:` reply. It
+displays nothing: show the decoded challenge and confirm the verification code with the operator
+first.
 
 ## Verifying an approval receipt
 

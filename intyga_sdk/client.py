@@ -12,7 +12,24 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-from .errors import GatewayRefused, GatewayUnreachable
+from .errors import (
+    GatewayRefused,
+    GatewayResponseUnreadable,
+    GatewayUnreachable,
+    IntygaError,
+    OfflineApprovalFailed,
+)
+from .offline import (
+    OfflineApprovalOptions,
+    clear_pending_approval,
+    read_pending_approvals,
+    use_offline_approval,
+)
+
+# Back-to-back polling failures before require_approval treats the gateway as unreachable. A human
+# approval can outlast a transient 502 or a dropped socket, so one bad poll must not end the wait.
+# The same number in every SDK (TypeScript, Go, Rust, Java).
+MAX_POLL_ERRORS = 5
 
 # A cached exchange is served only while more than this remains of the lifetime the gateway
 # advertised in `expires_in`; past it the client re-exchanges BEFORE the token can 401 mid-poll.
@@ -97,11 +114,32 @@ def _remaining_request_seconds() -> Optional[float]:
     return max(0.001, deadline - _monotonic())
 
 
+class _BodyUnreadable(Exception):
+    """Internal: the status line arrived, then reading the body failed."""
+
+    def __init__(self, status: int, cause: BaseException):
+        super().__init__(str(cause))
+        self.status = status
+
+
 async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, json_body: Optional[Any] = None) -> tuple[int, str]:
+    """One HTTP exchange, as (status, body text).
+
+    Two failure phases, kept apart because DIV §5a depends on the difference. Before a response exists
+    — connect, TLS, sending, or waiting for the status line and headers — the gateway was not asked:
+    `GatewayUnreachable`, which may route an opted-in call offline. Once headers have arrived, it WAS
+    asked: a body that then cannot be read (dropped connection, the deadline elapsing mid-body) is
+    `GatewayResponseUnreadable`, which never routes offline. The body is streamed so the two phases are
+    observable at all — a buffered request reads headers and body as one step.
+    """
     remaining = _remaining_request_seconds()
     remaining = 30.0 if remaining is None else min(30.0, remaining)
+    # The status line, once it has arrived. Set before the body is read, so a deadline that fires
+    # mid-body is attributed to the right phase.
+    answered: Optional[int] = None
 
     async def request() -> tuple[int, str]:
+        nonlocal answered
         # A client is scoped to this request because callers may use separate asyncio.run() loops.
         # The explicit SSLContext preserves the operating system trust store used by urllib.
         async with httpx.AsyncClient(
@@ -109,8 +147,13 @@ async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[s
             timeout=remaining,
             verify=ssl.create_default_context(),
         ) as client:
-            response = await client.request(method, url, headers=headers, json=json_body)
-            return response.status_code, response.text
+            async with client.stream(method, url, headers=headers, json=json_body) as response:
+                answered = response.status_code
+                try:
+                    await response.aread()
+                except httpx.HTTPError as e:
+                    raise _BodyUnreadable(response.status_code, e) from e
+                return response.status_code, response.text
 
     try:
         # HTTPX timeouts bound inactivity per operation. wait_for additionally bounds the complete
@@ -119,8 +162,22 @@ async def _async_request(url: str, method: str = "GET", headers: Optional[Dict[s
         # this deadline governs approval acceptance and cancellable HTTP I/O, not process shutdown.
         return await asyncio.wait_for(request(), timeout=remaining)
     except asyncio.TimeoutError as e:
+        if answered is not None:
+            raise GatewayResponseUnreadable(
+                answered,
+                f"the gateway answered {answered}, but the request deadline elapsed while reading its body",
+            ) from e
         raise GatewayUnreachable("Connection failed: request deadline elapsed") from e
+    except _BodyUnreadable as e:
+        raise GatewayResponseUnreadable(
+            e.status, f"the gateway answered {e.status}, but its response body could not be read: {e}"
+        ) from e.__cause__
     except httpx.RequestError as e:
+        if answered is not None:
+            # Closing the stream after a complete read failed: the answer is in, so not an outage.
+            raise GatewayResponseUnreadable(
+                answered, f"the gateway answered {answered}, but the exchange did not complete: {e}"
+            ) from e
         raise GatewayUnreachable(f"Connection failed: {e}") from e
 
 def _require_secure_gateway_url(gateway_url: str) -> str:
@@ -160,6 +217,13 @@ def _is_loopback_host(host: str, netloc: str) -> bool:
         return addr == ipaddress.IPv6Address("::1") and "[" in netloc
     # A dotted quad only (ip_address already refuses "127.1"-style shorthand).
     return addr in ipaddress.IPv4Network("127.0.0.0/8")
+
+
+def _could_not_ask(err: BaseException) -> bool:
+    """The only failures that may route an opted-in call offline (DIV §5a): no HTTP response at all,
+    or a 5xx from the infrastructure in front of the gateway. A 4xx is a verdict, and a response
+    whose body could not be read was still an answer."""
+    return isinstance(err, GatewayUnreachable) or (isinstance(err, GatewayRefused) and err.status >= 500)
 
 
 class IntygaClient:
@@ -292,8 +356,10 @@ class IntygaClient:
         method: str = "GET",
         json_body: Optional[Any] = None,
         _retried: bool = False,
+        expect_json: bool = True,
     ) -> Dict[str, Any]:
         """One bearer-authenticated request, parsed as JSON; every non-2xx raises GatewayRefused.
+        With `expect_json=False` a 2xx is success whatever its body, and `{}` is returned.
 
         A 401 against a token this client exchanged itself — not an explicit `token`, not a stored
         credential — clears the cache and retries exactly once with a fresh client-credentials
@@ -310,13 +376,15 @@ class IntygaClient:
         if status == 401 and not self._token:
             if self._cached_source == "exchange" and not _retried:
                 self._invalidate_token()
-                return await self._request_authed(op, url, method=method, json_body=json_body, _retried=True)
+                return await self._request_authed(
+                    op, url, method=method, json_body=json_body, _retried=True, expect_json=expect_json
+                )
             if self._cached_source == "stored":
                 self._invalidate_token()
                 raise GatewayRefused(401, f"{op} failed: {_STORED_CREDENTIAL_REJECTED}")
         if status < 200 or status >= 300:
             raise GatewayRefused(status, f"{op} failed: {status} {body}")
-        return json.loads(body)
+        return json.loads(body) if expect_json else {}
 
     async def authorize(
         self,
@@ -383,8 +451,23 @@ class IntygaClient:
         interval_ms: Optional[int] = None,
         target: Optional[str] = None,
         agent_context: Optional[Dict[str, Any]] = None,
+        offline: Optional[OfflineApprovalOptions] = None,
     ) -> Dict[str, Any]:
-        """Create a challenge and block until approved, denied, or expired."""
+        """Create a challenge and block until approved, denied, or expired.
+
+        A transient polling failure is retried; `MAX_POLL_ERRORS` consecutive ones end the wait.
+
+        `offline` opts THIS call in to the offline-approval fallback (docs/DIV.md §5a). Omitted means
+        no fallback, ever — pass it only at the call sites permitted to run under an offline approval;
+        a process-wide default would make every gated action accept an out-of-band approval. The
+        fallback runs only when the gateway could not be ASKED: a transport failure or timeout, a 5xx,
+        or `MAX_POLL_ERRORS` consecutive polling failures. A 4xx, `DENIED` or `EXPIRED` is never
+        routed offline — a human or the policy was reached and did not approve — and an
+        `agent_context` request never falls back. A completed fallback returns
+        `{"status": "OFFLINE_APPROVED", "receipt", "nonce"}`, never `"APPROVED"`; one that does not
+        complete raises `OfflineApprovalFailed`. Without `offline`, the transport error is raised as
+        before.
+        """
         resolved_timeout_ms = (
             timeout_ms
             if timeout_ms is not None
@@ -409,41 +492,171 @@ class IntygaClient:
         ):
             raise ValueError("interval_ms must be a finite number greater than zero")
         interval_sec = resolved_interval_ms / 1000
+        # Set when the gateway could not be asked: (what failed, the error). Handled after the loop,
+        # outside the request deadline, because the offline ceremony is human-paced and makes no
+        # gateway request.
+        unreachable: Optional[tuple] = None
         deadline_token = _request_deadline.set(deadline)
         try:
-            # `target` must be forwarded, not dropped. The Go and Rust ports rebuilt their options
-            # struct here field-by-field and lost it on exactly this path — the one most callers use.
-            auth_res = await self.authorize(
-                action_description=action_description,
-                action_type=action_type,
-                params=params,
-                timeout=backend_timeout_sec,
-                target=target,
-                agent_context=agent_context,
-            )
-            nonce = auth_res["nonce"]
-            context = {"agentContext": auth_res["agentContext"]} if "agentContext" in auth_res else {}
+            try:
+                # `target` must be forwarded, not dropped. The Go and Rust ports rebuilt their options
+                # struct here field-by-field and lost it on exactly this path — the one most callers use.
+                auth_res = await self.authorize(
+                    action_description=action_description,
+                    action_type=action_type,
+                    params=params,
+                    timeout=backend_timeout_sec,
+                    target=target,
+                    agent_context=agent_context,
+                )
+            except (GatewayUnreachable, GatewayRefused) as err:
+                # Could not even raise the challenge — the clearest "unreachable" signal there is,
+                # unless the gateway in fact answered, which _offline_fallback re-raises.
+                unreachable = (f"could not reach Intyga to request approval: {err}", err)
+            else:
+                nonce = auth_res["nonce"]
+                context = {"agentContext": auth_res["agentContext"]} if "agentContext" in auth_res else {}
 
-            # The nonce is merged into every return, terminal and expired alike — it is the challenge
-            # this result belongs to, and without it the one-shot helper's caller cannot pass
-            # `expected["nonce"]` to verify_approval_receipt or record redemption for their own
-            # single-use check. Matches @intyga/sdk, sdk-go and sdk-rust, which all set it.
-            while True:
-                if _monotonic() >= deadline:
-                    return {"status": "EXPIRED", "nonce": nonce, **context}
-                r = await self.status(nonce)
-                # The response is useful only if it arrived inside this relying party's wait
-                # window. Recheck after the await before accepting even an APPROVED status.
-                if _monotonic() >= deadline:
-                    return {"status": "EXPIRED", "nonce": nonce, **context}
-                if r.get("status") != "PENDING":
-                    return {**r, "nonce": nonce, **context}
-                remaining = deadline - _monotonic()
-                if remaining <= 0:
-                    return {"status": "EXPIRED", "nonce": nonce, **context}
-                await asyncio.sleep(min(interval_sec, remaining))
+                # The nonce is merged into every return, terminal and expired alike — it is the
+                # challenge this result belongs to, and without it the one-shot helper's caller cannot
+                # pass `expected["nonce"]` to verify_approval_receipt or record redemption for their own
+                # single-use check. Matches @intyga/sdk, sdk-go and sdk-rust, which all set it.
+                consecutive_errors = 0
+                # The first error in the current streak that was NOT "could not ask" — a 4xx, or a
+                # response whose body could not be read. If the streak reaches MAX_POLL_ERRORS it is
+                # raised, whatever came after it: a gateway that answered once and then went quiet was
+                # reached, and its answer was not an outage.
+                streak_refusal: Optional[IntygaError] = None
+                while True:
+                    if _monotonic() >= deadline:
+                        return {"status": "EXPIRED", "nonce": nonce, **context}
+                    try:
+                        r = await self.status(nonce)
+                    except (GatewayUnreachable, GatewayRefused, GatewayResponseUnreadable) as err:
+                        # A human approval can outlast a transient 502 or socket hangup — only give
+                        # up once the gateway looks genuinely unreachable.
+                        if not _could_not_ask(err) and streak_refusal is None:
+                            streak_refusal = err
+                        consecutive_errors += 1
+                        if consecutive_errors >= MAX_POLL_ERRORS:
+                            if streak_refusal is not None:
+                                raise streak_refusal
+                            unreachable = (
+                                f"polling failed after {MAX_POLL_ERRORS} consecutive errors: {err}",
+                                err,
+                            )
+                            break
+                    else:
+                        # The response is useful only if it arrived inside this relying party's wait
+                        # window. Recheck after the await before accepting even an APPROVED status.
+                        if _monotonic() >= deadline:
+                            return {"status": "EXPIRED", "nonce": nonce, **context}
+                        consecutive_errors = 0
+                        streak_refusal = None
+                        if r.get("status") != "PENDING":
+                            return {**r, "nonce": nonce, **context}
+                    remaining = deadline - _monotonic()
+                    if remaining <= 0:
+                        return {"status": "EXPIRED", "nonce": nonce, **context}
+                    await asyncio.sleep(min(interval_sec, remaining))
         finally:
             _request_deadline.reset(deadline_token)
+        cause, err = unreachable
+        return await self._offline_fallback(
+            cause,
+            err,
+            offline,
+            agent_context=agent_context,
+            expected={
+                "target": self._resolve_target(target),
+                "actionType": action_type if action_type is not None else "",
+                "display": action_description,
+                "params": params if params is not None else {},
+            },
+        )
+
+    async def _offline_fallback(
+        self,
+        cause: str,
+        err: Exception,
+        offline: Optional[OfflineApprovalOptions],
+        *,
+        agent_context: Optional[Dict[str, Any]],
+        expected: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """The ONLY route to an offline approval: reached exclusively when the gateway could not be asked.
+
+        A 4xx means the gateway WAS reached and refused — 403 is its own fail-closed "cannot resolve
+        the requirement", and 401/429 are equally deliberate — so it is re-raised: treating a refusal
+        as unreachability would turn a policy denial into a different approval route (DIV §3.4). A 5xx
+        is infrastructure failing, which is exactly the "could not ask" §5a is written for.
+        """
+        if not _could_not_ask(err):
+            raise err
+        if offline is None:
+            raise err
+        if agent_context is not None:
+            reason = "agent continuity requests cannot fall back to an unchained offline proof"
+            raise OfflineApprovalFailed(f"{cause} — {reason}", reason) from err
+        result = await use_offline_approval(expected, offline)
+        if not result.get("ok"):
+            reason = str(result.get("reason"))
+            raise OfflineApprovalFailed(
+                f"{cause} — and the offline approval did not complete: {reason}", reason
+            ) from err
+        # Never "APPROVED": the usual caller guard tests for that exact string, so a distinct status is
+        # what stops an existing service silently accepting out-of-band approvals (DIV §5a.7).
+        return {"status": "OFFLINE_APPROVED", "receipt": result["receipt"], "nonce": result["nonce"]}
+
+    async def reconcile_offline_approvals(
+        self, bundle_dir: Any, buffer_dir: Any = None
+    ) -> Dict[str, Any]:
+        """Report offline approvals that happened while the gateway was unreachable (DIV §5a.7).
+
+        Call it on reconnect — a scheduled retry, a health-check hook, service start. Until an approval
+        is reported it exists only on this relying party's disk, and an unreported approval is
+        indistinguishable from an unauthorized action. Each pending record is POSTed to
+        `/offline-approval/reconcile` with its full receipt, so the gateway re-verifies it rather than
+        taking our word for it. A record is cleared ONLY on a 2xx; anything else leaves it queued. A
+        pending file that cannot be read is kept, counted as failed and named in `reasons`.
+
+        Returns `{"reported": int, "failed": int, "reasons": [str, ...]}`.
+        """
+        # Resolve credentials up front so a misconfigured client raises here, as it always did,
+        # instead of being counted as one "failed" report per buffered approval.
+        await self.token()
+        reasons = []
+        reported = 0
+        failed = 0
+        pending = read_pending_approvals(bundle_dir, buffer_dir)
+        # Counted, never skipped: a record nobody can read is still an approval nobody has reported.
+        for name in pending["unreadable"]:
+            failed += 1
+            reasons.append(f"{name}: unreadable pending record — report it by hand")
+        for use in pending["records"]:
+            nonce = use.get("nonce")
+            # JSON.stringify in the reference drops an absent member; the gateway's schema takes
+            # `delegationNonce` as optional-string, so null must not be sent in its place.
+            body = {
+                k: use[k]
+                for k in ("nonce", "usedAt", "target", "actionType", "display", "receipt", "delegationNonce")
+                if use.get(k) is not None
+            }
+            try:
+                await self._request_authed(
+                    "reconcile",
+                    f"{self._gateway_url}/offline-approval/reconcile",
+                    method="POST",
+                    json_body=body,
+                    expect_json=False,
+                )
+            except Exception as exc:  # noqa: BLE001 - every failure leaves the record queued
+                failed += 1
+                reasons.append(f"{nonce}: {exc}")
+                continue
+            clear_pending_approval(nonce, bundle_dir, buffer_dir)
+            reported += 1
+        return {"reported": reported, "failed": failed, "reasons": reasons}
 
     async def verify(self, document_hash: str) -> Dict[str, Any]:
         """Lookup a signed document witness by hash."""

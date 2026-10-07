@@ -4,6 +4,7 @@ Transport is stubbed at intyga_sdk.client._async_request / HTTPX, so these run o
 """
 
 import asyncio
+import contextlib
 import json
 import unittest
 from unittest import mock
@@ -11,7 +12,30 @@ from unittest import mock
 import httpx
 import intyga_sdk.client as client_mod
 from intyga_sdk.client import IntygaClient
-from intyga_sdk.errors import GatewayRefused, GatewayUnreachable
+from intyga_sdk.errors import GatewayRefused, GatewayResponseUnreadable, GatewayUnreachable
+
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+@contextlib.contextmanager
+def patched_transport(handler):
+    """Run the client's real httpx code path against `handler(request) -> httpx.Response` (or a raise),
+    so the streaming split between "no response" and "response, unreadable body" is exercised."""
+
+    def factory(**kwargs):
+        kwargs.pop("verify", None)
+        return _REAL_ASYNC_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
+
+    with mock.patch.object(client_mod.httpx, "AsyncClient", side_effect=factory):
+        yield
+
+
+class FailingBody(httpx.AsyncByteStream):
+    """A body that starts arriving and then the connection drops: headers were received."""
+
+    async def __aiter__(self):
+        yield b'{"nonce": '
+        raise httpx.ReadError("connection reset mid-body")
 
 
 def make_client() -> IntygaClient:
@@ -74,19 +98,30 @@ class TestTypedErrors(unittest.TestCase):
         self.assertNotIsInstance(ctx.exception, GatewayUnreachable)
 
     def test_transport_failure_raises_gateway_unreachable(self):
-        class RefusingClient:
-            async def __aenter__(self):
-                return self
+        def refuse(request):
+            raise httpx.ConnectError("connection refused")
 
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            async def request(self, method, url, headers=None, json=None):
-                raise httpx.ConnectError("connection refused")
-
-        with mock.patch.object(client_mod.httpx, "AsyncClient", return_value=RefusingClient()):
+        with patched_transport(refuse):
             with self.assertRaises(GatewayUnreachable):
                 asyncio.run(client_mod._async_request("https://gw.example/authorize", method="POST"))
+
+    def test_a_body_that_cannot_be_read_is_not_an_outage(self):
+        # Headers arrived, so the gateway WAS asked: never GatewayUnreachable, which may route an
+        # opted-in call offline (DIV §5a), and never a verdict either — whatever it said was lost.
+        for status in (200, 503):
+            with self.subTest(status=status):
+                with patched_transport(lambda request, status=status: httpx.Response(status, stream=FailingBody())):
+                    with self.assertRaises(GatewayResponseUnreadable) as ctx:
+                        asyncio.run(client_mod._async_request("https://gw.example/authorize", method="POST"))
+                self.assertEqual(ctx.exception.status, status)
+                self.assertNotIsInstance(ctx.exception, (GatewayUnreachable, GatewayRefused))
+
+    def test_a_readable_response_still_reads(self):
+        with patched_transport(lambda request: httpx.Response(201, json={"nonce": "n1"})):
+            status, body = asyncio.run(
+                client_mod._async_request("https://gw.example/authorize", method="POST", json_body={"a": 1})
+            )
+        self.assertEqual((status, json.loads(body)), (201, {"nonce": "n1"}))
 
 
 class TestGatewayUrlMustBeHttps(unittest.TestCase):

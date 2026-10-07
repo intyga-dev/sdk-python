@@ -30,6 +30,34 @@ class GatewayUnreachable(IntygaError):
     """The gateway could not be reached at all (DNS failure, refused connection, timeout)."""
 
 
+class GatewayResponseUnreadable(IntygaError):
+    """The gateway answered — `status` holds the status line it sent — but the response body could
+    not be read (the connection dropped mid-body, or the request deadline elapsed while reading it).
+
+    Deliberately neither of the two classes above. It is not an outage: a response arrived, so the
+    gateway was asked, and DIV §5a's offline fallback never applies to it (only "no HTTP response was
+    received" and a 5xx may route offline). And it is not a verdict either: whatever the gateway said
+    was lost, so it cannot be read as a refusal or an approval.
+    """
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class OfflineApprovalFailed(IntygaError):
+    """The gateway could not be asked, offline approval was requested for this call, and it did not
+    complete (DIV §5a). `reason` says why: no signatures, quorum short, no rule in the trust bundle,
+    or an agent-continuity request, which can never fall back to an unchained offline proof.
+
+    The original transport failure is chained as `__cause__`.
+    """
+
+    def __init__(self, message: str, reason: str):
+        super().__init__(message)
+        self.reason = reason
+
+
 class ApprovalRefused(IntygaError):
     """A guarded call did not receive human approval.
 

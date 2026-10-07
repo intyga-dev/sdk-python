@@ -10,7 +10,7 @@ from unittest import mock
 
 import intyga_sdk.client as client_mod
 from intyga_sdk.client import IntygaClient
-from intyga_sdk.errors import GatewayRefused, GatewayUnreachable
+from intyga_sdk.errors import GatewayRefused, GatewayResponseUnreadable, GatewayUnreachable
 from intyga_sdk.guard import require_human_approval
 
 from test_guard import signed_receipt
@@ -254,7 +254,11 @@ class TestRequestShapeAndDeadlines(unittest.TestCase):
                         f"http://127.0.0.1:{server.server_port}", token="token", target="rp"
                     )
                     started = time.monotonic()
-                    with self.assertRaises(GatewayUnreachable):
+                    # Before the headers, no response exists: an outage. After them, the gateway
+                    # answered and only its body was lost — never an outage, so never routed
+                    # offline (DIV §5a).
+                    expected = GatewayUnreachable if mode == "headers" else GatewayResponseUnreadable
+                    with self.assertRaises(expected):
                         asyncio.run(client.require_approval("transfer", timeout_ms=300))
                     elapsed = time.monotonic() - started
                     self.assertTrue(accepted.is_set(), f"{mode} timed out before the server accepted")

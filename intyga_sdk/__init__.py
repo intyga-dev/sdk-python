@@ -1,6 +1,13 @@
 from . import ledger
 from .client import IntygaClient
-from .errors import ApprovalRefused, GatewayRefused, GatewayUnreachable, IntygaError
+from .errors import (
+    ApprovalRefused,
+    GatewayRefused,
+    GatewayResponseUnreadable,
+    GatewayUnreachable,
+    IntygaError,
+    OfflineApprovalFailed,
+)
 from .guard import require_human_approval
 from .rfc3161 import verify_rfc3161_anchor
 from .crypto import (
@@ -25,13 +32,49 @@ from .crypto import (
     WEAKER_REQUIREMENT_REASON,
     PolicyCrypto as policy,
 )
+from .trust_bundle import (
+    DIV_TRUST_BUNDLE_TYPE,
+    MAX_TRUST_BUNDLE_AGE_DAYS,
+    approver_anchor,
+    check_trust_bundle_freshness,
+    load_trust_bundle,
+    requirement_for,
+    save_trust_bundle,
+    verify_trust_bundle,
+)
+from .trust_anchor import (
+    TRUST_ANCHOR_FILE_TYPE,
+    InvalidTrustAnchorFile,
+    parse_trust_anchor_file,
+    trust_anchor_approvers,
+)
+from .offline import (
+    CHALLENGE_ENVELOPE_PREFIX,
+    SIGNATURE_ENVELOPE_PREFIX,
+    DEFAULT_OFFLINE_WINDOW_MINUTES,
+    FileRedemptionStore,
+    OfflineApprovalOptions,
+    RedemptionStore,
+    assemble_offline_receipt,
+    clear_pending_approval,
+    create_offline_challenge,
+    decode_challenge_envelope,
+    decode_signature_envelope,
+    encode_signature_envelope,
+    pending_approvals,
+    read_pending_approvals,
+    sign_challenge_envelope,
+    use_offline_approval,
+)
 
 __all__ = [
     "IntygaClient",
     "IntygaError",
     "GatewayRefused",
     "GatewayUnreachable",
+    "GatewayResponseUnreadable",
     "ApprovalRefused",
+    "OfflineApprovalFailed",
     "require_human_approval",
     "verify_rfc3161_anchor",
     "stable_stringify",
@@ -55,4 +98,33 @@ __all__ = [
     "WEAKER_REQUIREMENT_REASON",
     "policy",
     "ledger",
+    # Offline approval (DIV §5a, docs/OFFLINE-APPROVAL-SDK.md)
+    "DIV_TRUST_BUNDLE_TYPE",
+    "MAX_TRUST_BUNDLE_AGE_DAYS",
+    "verify_trust_bundle",
+    "check_trust_bundle_freshness",
+    "save_trust_bundle",
+    "load_trust_bundle",
+    "approver_anchor",
+    "requirement_for",
+    "TRUST_ANCHOR_FILE_TYPE",
+    "InvalidTrustAnchorFile",
+    "parse_trust_anchor_file",
+    "trust_anchor_approvers",
+    "CHALLENGE_ENVELOPE_PREFIX",
+    "SIGNATURE_ENVELOPE_PREFIX",
+    "DEFAULT_OFFLINE_WINDOW_MINUTES",
+    "create_offline_challenge",
+    "decode_challenge_envelope",
+    "encode_signature_envelope",
+    "decode_signature_envelope",
+    "sign_challenge_envelope",
+    "assemble_offline_receipt",
+    "RedemptionStore",
+    "FileRedemptionStore",
+    "OfflineApprovalOptions",
+    "use_offline_approval",
+    "pending_approvals",
+    "read_pending_approvals",
+    "clear_pending_approval",
 ]

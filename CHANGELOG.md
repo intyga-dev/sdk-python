@@ -5,6 +5,45 @@ All notable changes to `intyga-sdk` (Python) are documented here. The format fol
 
 ## [Unreleased]
 
+## [1.2.0]
+
+- **Offline approval, SDK half (DIV §5a, `docs/OFFLINE-APPROVAL-SDK.md`).** Ports the TypeScript
+  reference and passes every section of the shared `offline-approval-vectors.json`
+  (`tests/test_offline_approval_vectors.py`). New: trust-bundle verification (RS256 JWS against a
+  pinned JWK, 30-day age cap), `save_trust_bundle`/`load_trust_bundle`, `approver_anchor`
+  (`ordinary` / `offline-intent`), `requirement_for` (exact-ID policy selection, in
+  `intyga_sdk.approval_policy`), `parse_trust_anchor_file`/`trust_anchor_approvers`,
+  `create_offline_challenge`, `DIV1:`/`SIG1:` envelopes, `sign_challenge_envelope`,
+  `assemble_offline_receipt`, `FileRedemptionStore`, `use_offline_approval`, `pending_approvals` and
+  `clear_pending_approval`, plus `read_pending_approvals` (records and the names of unreadable
+  files). The bundle directory layout is shared with the other SDKs. Envelopes are strict base64url of
+  a JSON object (a stray character, `null` or an array is a refusal of that envelope); SIG1 `did`,
+  `key`, `sig` and a present `alg` must be non-empty strings; the pinned bundle key must be RSA;
+  bundle timestamps follow the strict RFC 3339 grammar; the challenge window must be a whole number of
+  minutes and a supplied empty nonce is refused. A decoded challenge must also be well-shaped, not
+  merely canonical (`"target": 5` re-serializes identically): string `target`/`actionType`/`display`/
+  `nonce`/`challengedAt`/`expiresAt`, a non-blank target, object `params`/`requirement`, and a
+  `requester` with a string `did`. `create_offline_challenge` refuses a blank target. Envelope trimming
+  follows JavaScript's `String.prototype.trim` (a BOM is trimmed, U+0085 is not). Signing keys may be
+  PKCS#8 PEM, SEC1 PEM (`EC PRIVATE KEY`) or DER PKCS#8.
+- `IntygaClient.require_approval(..., offline=OfflineApprovalOptions(...))` falls back to an offline
+  approval only when the gateway could not be asked (transport failure, timeout, 5xx, or five
+  consecutive polling failures), never on a 4xx, `DENIED`, `EXPIRED` or an `agent_context` request,
+  and reports `OFFLINE_APPROVED`, never `APPROVED`. A fallback that does not complete raises the new
+  `OfflineApprovalFailed`. New `IntygaClient.reconcile_offline_approvals(bundle_dir)` reports
+  buffered approvals, clears a record only on a 2xx, and counts an unreadable pending file as failed
+  (kept, and named in `reasons`).
+- `require_approval` now tolerates up to four consecutive polling failures (`GatewayUnreachable` or
+  `GatewayRefused`) before giving up, as the TypeScript, Go, Rust and Java clients already did; it
+  previously raised on the first. A streak that contains a 4xx raises that 4xx and never routes
+  offline, even when a 5xx ends it; a successful poll resets the streak. Otherwise, without
+  `offline=`, the fifth failure is raised unchanged.
+- New `GatewayResponseUnreadable` (with `.status`): the gateway answered, but the response body could
+  not be read (connection dropped mid-body, or the request deadline elapsed while reading it). The
+  body is now streamed so this is told apart from `GatewayUnreachable`, which is raised only when no
+  response arrived at all. It never routes an offline-enabled call offline. **Behaviour change:** a
+  body-phase failure previously raised `GatewayUnreachable`.
+
 ## [1.1.0]
 
 - No code change. The matched set moves together (`pnpm test:versions`); this release carries the

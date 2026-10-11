@@ -89,6 +89,8 @@ def parse_trust_anchor_file(json_text: Any, *, purpose: Optional[str] = "online"
         raise _fail("label must be a string")
     if "exportedAt" in obj and not isinstance(obj["exportedAt"], str):
         raise _fail("exportedAt must be a string")
+    if "tenantId" in obj and (not isinstance(obj["tenantId"], str) or obj["tenantId"] == ""):
+        raise _fail("tenantId must be a non-empty string when present")
 
     approvers = obj.get("approvers")
     if not isinstance(approvers, list) or not approvers:

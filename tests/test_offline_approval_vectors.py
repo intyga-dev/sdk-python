@@ -95,7 +95,14 @@ class TestOfflineApprovalVectors(unittest.TestCase):
     def test_bundle_anchor(self):
         for i, c in enumerate(V["bundleAnchor"]):
             with self.subTest(i=i, purpose=c["purpose"], limit=c["limitToDids"]):
-                anchor = approver_anchor(V["bundle"], c["limitToDids"], c["purpose"])
+                anchor = None
+                try:
+                    anchor = approver_anchor(V["bundle"], c["limitToDids"], c["purpose"])
+                except ValueError:
+                    pass  # refused
+                self.assertEqual(anchor is not None, c["ok"])
+                if anchor is None:
+                    continue
                 self.assertEqual(anchor["dids"], c["expect"]["dids"])
                 for did, keys in c["expect"]["keys"].items():
                     self.assertEqual(anchor["resolveKey"](did), keys, did)
@@ -116,6 +123,7 @@ class TestOfflineApprovalVectors(unittest.TestCase):
                     got = {
                         "purpose": parsed["purpose"],
                         "epoch": parsed["epoch"],
+                        **({"tenantId": parsed["tenantId"]} if "tenantId" in parsed else {}),
                         "dids": anchor["dids"],
                         "keys": {d: anchor["resolveKey"](d) for d in anchor["dids"]},
                     }
@@ -130,6 +138,13 @@ class TestOfflineApprovalVectors(unittest.TestCase):
             with self.subTest(c["name"]):
                 inp = dict(c["input"])
                 delegation = inp.pop("delegation", None)
+                bundle = dict(V["bundle"])
+                if "bundleTenantId" in inp:
+                    bundle_tenant_id = inp.pop("bundleTenantId")
+                    if bundle_tenant_id is None:
+                        bundle.pop("tenantId", None)
+                    else:
+                        bundle["tenantId"] = bundle_tenant_id
                 as_of = at(inp.pop("asOf"))
                 kwargs = {
                     "target": inp.pop("target"),
@@ -151,7 +166,7 @@ class TestOfflineApprovalVectors(unittest.TestCase):
                         "params": kwargs["params"],
                         "signers": [],
                     }
-                r = create_offline_challenge(bundle=V["bundle"], as_of=as_of, **kwargs)
+                r = create_offline_challenge(bundle=bundle, as_of=as_of, **kwargs)
                 self.assertEqual(r["ok"], c["ok"], f"{c['name']}: {r.get('reason')}")
                 if not c["ok"]:
                     continue
@@ -210,13 +225,21 @@ class TestOfflineApprovalVectors(unittest.TestCase):
                 with self.subTest(c["name"]):
                     case_dir = tempfile.mkdtemp(prefix="case-", dir=scratch)
                     with open(os.path.join(case_dir, "trust-bundle.jws"), "w", encoding="utf-8") as f:
-                        f.write(V["bundleJws"])
+                        f.write(c.get("bundleJws", V["bundleJws"]))
                     with open(os.path.join(case_dir, "gateway-key.jwk.json"), "w", encoding="utf-8") as f:
                         f.write(json.dumps(V["gatewayJwk"], separators=(",", ":")))
                     delegation_dir = None
-                    if c.get("delegation"):
+                    if c.get("delegation") or c.get("delegationArtifacts"):
                         delegation_dir = os.path.join(case_dir, "delegations")
                         os.mkdir(delegation_dir)
+                        for i, artifact in enumerate(c.get("delegationArtifacts", [])):
+                            with open(
+                                os.path.join(delegation_dir, f"00-invalid-{i:02d}.json"),
+                                "w",
+                                encoding="utf-8",
+                            ) as f:
+                                f.write(json.dumps(artifact, ensure_ascii=False))
+                    if c.get("delegation"):
                         with open(
                             os.path.join(delegation_dir, f"{c['delegation']}.json"), "w", encoding="utf-8"
                         ) as f:
@@ -240,13 +263,18 @@ class TestOfflineApprovalVectors(unittest.TestCase):
                             )
                         return out
 
+                    buffer_dir = os.path.join(case_dir, "not-a-directory") if c.get("bufferFailure") else None
+                    if buffer_dir:
+                        with open(buffer_dir, "w") as f:
+                            f.write("buffer failure")
                     r = asyncio.run(
                         use_offline_approval(
                             c["action"],
                             OfflineApprovalOptions(
                                 bundle_dir=case_dir,
+                                buffer_dir=buffer_dir,
                                 delegation_dir=delegation_dir,
-                                requester_did=V["requesterDid"],
+                                requester_did=c.get("requesterDid", V["requesterDid"]),
                                 as_of=at(c["asOf"]),
                                 warn=lambda _m: None,
                                 collect_signatures=collect,
@@ -254,6 +282,9 @@ class TestOfflineApprovalVectors(unittest.TestCase):
                         )
                     )
                     self.assertEqual(r["ok"], c["ok"], f"{c['name']}: {r.get('reason')}")
+                    if c.get("bufferFailure"):
+                        self.assertIn("could not buffer", r.get("reason", ""))
+                        self.assertEqual(os.listdir(os.path.join(case_dir, ".redeemed")), [])
                     if not c["ok"]:
                         continue
                     self.assertEqual(sorted(r["signers"]), c["expect"]["signers"])

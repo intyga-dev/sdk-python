@@ -44,6 +44,7 @@ def require_human_approval(
     approvers: Optional[Dict[str, Any]] = None,
     expected_origin: Optional[str] = None,
     expected_rp_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator factory: the wrapped callable executes only after a human approves it.
 
@@ -60,6 +61,8 @@ def require_human_approval(
 
     `expected_origin` / `expected_rp_id` are forwarded to the receipt verifier and are REQUIRED for
     a WEBAUTHN (passkey) witness to be countable (DIV §4.4.5, fail-closed when unset).
+    `tenant_id` is the independently trusted tenant expected on DIV v2 receipts. Supply it from the
+    configured trust anchor; it is never inferred from the gateway response or receipt.
 
     Omitting `approvers` keeps the pre-existing behavior — the gateway's `status` string is trusted
     — and warns, because the caller is then relying on the transport rather than on a signature.
@@ -129,6 +132,7 @@ def require_human_approval(
                     "params": kwargs,
                     "nonce": result.get("nonce"),
                     "approvers": approvers,
+                    **({"tenantId": tenant_id} if tenant_id is not None else {}),
                 },
                 expected_origin=expected_origin,
                 expected_rp_id=expected_rp_id,

@@ -248,6 +248,10 @@ class IntygaClient:
         service constructed with no credentials — which should raise — silently assumed whatever
         principal a human's `intyga login` had left in that account's home directory.
 
+        Supplying either `client_id` or `client_secret` selects client-credentials authentication
+        and stored login credentials are not consulted. An incomplete or rejected pair therefore
+        fails closed instead of changing the caller to the human who last ran `intyga login`.
+
         `gateway_url` must be https://; http:// is accepted only for a loopback host (localhost,
         127.0.0.0/8, ::1) for local development. Anything else raises ValueError here, before any
         credential is sent.
@@ -303,6 +307,10 @@ class IntygaClient:
         if cached is not None and self._cache_is_fresh():
             return cached
         self._invalidate_token()
+        # Supplying either half explicitly selects the service principal. Falling back to a saved
+        # human login for an incomplete or rejected pair would silently change tenant/requester.
+        if self._client_id is not None or self._client_secret is not None:
+            return await self._exchange()
         if self._allow_stored_credentials:
             stored = _load_stored_token(self._gateway_url)
             if stored:

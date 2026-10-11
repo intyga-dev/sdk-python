@@ -10,8 +10,10 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Tuple, Optional
 
-# DIV protocol constants (docs/DIV.md v1).
+# DIV protocol constants. v1 remains the historical unbound format; v2 adds tenantId.
 DIV_VERSION = 1
+DIV_TENANT_BOUND_VERSION = 2
+_TENANT_ID_ABSENT = object()
 DIV_INTENT_TYPE = "div-intent-verification"
 # Sealed break-glass: an approval signed ahead of time for a pre-declared emergency runbook and
 # verified offline while the gateway is unreachable. The distinct type is INSIDE the signed bytes, so
@@ -220,8 +222,12 @@ def canonical_intent_payload(
     nonce: str,
     expires_at: str,
     agent_context: Optional[Dict[str, Any]] = None,
+    tenant_id: Any = _TENANT_ID_ABSENT,
 ) -> str:
-    """Canonical DIV Intent Payload (docs/DIV.md v1).
+    """Canonical DIV Intent Payload. Omitting ``tenant_id`` preserves v1; a non-empty value emits v2.
+
+    Passing ``None`` or an empty string explicitly is refused, so an accidental missing tenant can
+    never silently produce a new legacy payload.
 
     Byte-identical to ``canonicalIntentPayload`` in @intyga/mcp-schemas, @intyga/verify and
     the Go/Rust ports. Strict RFC 8785 JCS: the WHOLE object is serialized via ``stable_stringify``,
@@ -237,7 +243,6 @@ def canonical_intent_payload(
     """
     req, rq = _canonical_common(requester, requirement)
     payload = {
-            "v": DIV_VERSION,
             "type": DIV_INTENT_TYPE,
             "target": target,
             "actionType": action_type,
@@ -257,7 +262,23 @@ def canonical_intent_payload(
     else:
         payload.update({key: agent_context[key] for key in ("action", "agent", "session", "nbf")})
         payload["exp"] = expires_at
+    _apply_tenant_binding(payload, tenant_id)
     return stable_stringify(payload)
+
+
+def _apply_tenant_binding(payload: Dict[str, Any], tenant_id: Any) -> None:
+    """Preserve v1 bytes when absent; emit v2 for one opaque, non-empty tenant ID."""
+    if tenant_id is _TENANT_ID_ABSENT:
+        payload["v"] = DIV_VERSION
+        return
+    if not isinstance(tenant_id, str) or tenant_id == "":
+        raise NonCanonicalValue("tenant_id must be a non-empty opaque string")
+    payload["v"] = DIV_TENANT_BOUND_VERSION
+    payload["tenantId"] = tenant_id
+
+
+def _tenant_builder_kwargs(tenant_id: Optional[str]) -> Dict[str, str]:
+    return {} if tenant_id is None else {"tenant_id": tenant_id}
 
 
 
@@ -311,6 +332,7 @@ def canonical_offline_intent_payload(
     nonce: str,
     challenged_at: str,
     expires_at: str,
+    tenant_id: Any = _TENANT_ID_ABSENT,
 ) -> str:
     """Canonical OFFLINE APPROVAL payload (docs/DIV.md §5a.2).
 
@@ -324,9 +346,7 @@ def canonical_offline_intent_payload(
     payload minted with an over-long ``expires_at`` is otherwise indistinguishable from a correct one.
     """
     req, rq = _canonical_common(requester, requirement)
-    return stable_stringify(
-        {
-            "v": DIV_VERSION,
+    payload = {
             "type": DIV_OFFLINE_INTENT_TYPE,
             "target": target,
             "actionType": action_type,
@@ -343,7 +363,8 @@ def canonical_offline_intent_payload(
             "challengedAt": challenged_at,
             "expiresAt": expires_at,
         }
-    )
+    _apply_tenant_binding(payload, tenant_id)
+    return stable_stringify(payload)
 
 
 def canonical_delegation_payload(
@@ -358,6 +379,7 @@ def canonical_delegation_payload(
     nonce: str,
     sealed_at: str,
     expires_at: str,
+    tenant_id: Any = _TENANT_ID_ABSENT,
 ) -> str:
     """Canonical DELEGATION payload (docs/DIV.md §5a.5) — a signed statement about WHO MAY APPROVE,
     not about what may run.
@@ -367,9 +389,7 @@ def canonical_delegation_payload(
     ``delegated_to`` must sign at incident time. Two different quorums, so both are in the signed bytes.
     """
     req, rq = _canonical_common(requester, requirement)
-    return stable_stringify(
-        {
-            "v": DIV_VERSION,
+    payload = {
             "type": DIV_DELEGATION_TYPE,
             "target": target,
             "actionType": action_type,
@@ -383,35 +403,42 @@ def canonical_delegation_payload(
             "sealedAt": sealed_at,
             "expiresAt": expires_at,
         }
-    )
+    _apply_tenant_binding(payload, tenant_id)
+    return stable_stringify(payload)
 
 
 def canonical_agent_authority_payload(
     target: str, action_patterns: list, display: str, agent: Dict[str, Any],
     requester: Dict[str, Any], requirement: Dict[str, Any], nonce: str,
     sealed_at: str, expires_at: str, parent_receipt_hash: Optional[str] = None,
+    tenant_id: Any = _TENANT_ID_ABSENT,
 ) -> str:
     """DIV §5b governance evidence; never an execution approval."""
     req, rq = _canonical_common(requester, requirement)
-    return stable_stringify({
-        "v": DIV_VERSION, "type": DIV_AGENT_AUTHORITY_TYPE, "target": target,
+    payload = {
+        "type": DIV_AGENT_AUTHORITY_TYPE, "target": target,
         "actionPatterns": sorted(action_patterns, key=lambda p: p.encode("utf-16-be")),
         "display": display, "agent": {"did": agent["did"]}, "parentReceiptHash": parent_receipt_hash, "requester": req,
         "requirement": rq, "nonce": nonce, "sealedAt": sealed_at, "expiresAt": expires_at,
-    })
+    }
+    _apply_tenant_binding(payload, tenant_id)
+    return stable_stringify(payload)
 
 
 def canonical_platform_intent_payload(
     payload_hash: str, rp_id: str, subject_external_id: str, signed_at: str,
     expires_at: str, nonce: str,
+    tenant_id: Any = _TENANT_ID_ABSENT,
 ) -> str:
     """Reproduce DIV §5c bytes; digest validation belongs to the verifier."""
-    return stable_stringify({
-        "v": DIV_VERSION, "type": DIV_PLATFORM_INTENT_TYPE, "hashAlg": "SHA-256",
+    payload = {
+        "type": DIV_PLATFORM_INTENT_TYPE, "hashAlg": "SHA-256",
         "payloadHash": payload_hash, "rpId": rp_id,
         "subject": {"externalId": subject_external_id}, "signedAt": signed_at,
         "expiresAt": expires_at, "nonce": nonce,
-    })
+    }
+    _apply_tenant_binding(payload, tenant_id)
+    return stable_stringify(payload)
 
 
 def canonical_action_payload(nonce: str, action_type: str, summary: str, params: Dict[str, Any]) -> str:
@@ -813,6 +840,37 @@ def requires_hardware_credential(requirement: Dict[str, Any]) -> bool:
         requirement.get("requireHardwareKey") is True or (isinstance(aaguids, list) and len(aaguids) > 0)))
 
 
+def _verify_tenant_binding(
+    payload: Dict[str, Any], expected: Dict[str, Any], explicit_tenant_id: Optional[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """Bind DIV v2 to caller-owned tenant context without ever inferring it from the artifact."""
+    version = payload.get("v")
+    if type(version) is not int or version not in (DIV_VERSION, DIV_TENANT_BOUND_VERSION):
+        return None, "unsupported DIV payload version"
+
+    map_supplied = "tenantId" in expected
+    if explicit_tenant_id is not None and map_supplied and expected.get("tenantId") != explicit_tenant_id:
+        return None, "expected_tenant_id conflicts with expected['tenantId']"
+    supplied = explicit_tenant_id is not None or map_supplied
+    expected_tenant = explicit_tenant_id if explicit_tenant_id is not None else expected.get("tenantId")
+
+    if version == DIV_VERSION:
+        if "tenantId" in payload:
+            return None, "legacy DIV v1 payload must not carry tenantId"
+        if supplied:
+            return None, "legacy DIV v1 payload is not tenant-bound and cannot satisfy an expected tenant"
+        return None, None
+
+    tenant_id = payload.get("tenantId")
+    if not isinstance(tenant_id, str) or tenant_id == "":
+        return None, "DIV v2 payload requires a non-empty tenantId"
+    if not supplied or not isinstance(expected_tenant, str) or expected_tenant == "":
+        return None, "DIV v2 verification requires an independently supplied expected tenant"
+    if tenant_id != expected_tenant:
+        return None, "payload tenantId does not match the expected tenant"
+    return expected_tenant, None
+
+
 @_never_raises
 def verify_approval_receipt(
     receipt: Dict[str, Any],
@@ -827,6 +885,8 @@ def verify_approval_receipt(
     allow_cross_origin: bool = False,
     allow_offline: bool = False,
     delegation: "Dict[str, Any] | None" = None,
+    expected_tenant_id: str = None,
+    agent_authority_chain: "list | None" = None,
 ) -> Dict[str, Any]:
     """
     Independently verify a DIV Proof Envelope. Returns {'ok': True} or {'ok': False, 'reason': ...}.
@@ -875,10 +935,9 @@ def verify_approval_receipt(
         return {"ok": False, "reason": "malformed canonicalPayload"}
     nonce = payload_data.get("nonce", "")
 
-    version = payload_data.get("v")
-    if version != DIV_VERSION:
-        shown = version if isinstance(version, int) and version else "unparseable"
-        return {"ok": False, "reason": f"unsupported DIV payload version ({shown})"}
+    tenant_id, tenant_problem = _verify_tenant_binding(payload_data, expected, expected_tenant_id)
+    if tenant_problem:
+        return {"ok": False, "reason": tenant_problem}
     payload_type = payload_data.get("type")
     # A DELEGATION authorizes nothing (DIV §5a.5). Refused here unconditionally — there is deliberately
     # NO option that would let one through, because a delegation that could authorize its own action
@@ -956,7 +1015,28 @@ def verify_approval_receipt(
             return {"ok": False, "reason": "invalid independently asserted agent context: " + context_problem}
         agent = agent_context.get("agent")
         if isinstance(agent, dict) and agent.get("delegatedBy") is not None:
-            return {"ok": False, "reason": "delegated agent receipt requires a trusted root-to-leaf authority chain"}
+            requester_did = expected.get("requesterDid")
+            if not isinstance(requester_did, str) or not requester_did or not agent_authority_chain:
+                return {"ok": False, "reason": "delegated agent receipt requires a trusted root-to-leaf authority chain"}
+            authority = verify_agent_delegation_chain(
+                agent_authority_chain,
+                {
+                    "tenantId": tenant_id,
+                    "target": expected.get("target"),
+                    "actionType": expected.get("actionType"),
+                    "agentDid": requester_did,
+                    "delegatedBy": agent.get("delegatedBy"),
+                },
+                expected_origin=expected_origin,
+                expected_rp_id=expected_rp_id,
+                require_user_verification=require_user_verification,
+                allow_cross_origin=allow_cross_origin,
+                allow_expired=allow_expired,
+                as_of=as_of,
+                clock_skew_seconds=clock_skew_seconds,
+            )
+            if not authority.get("ok"):
+                return authority
         nbf = _parse_rfc3339(agent_context.get("nbf"))
         expiry = _parse_rfc3339(expires_at)
         now = as_of or datetime.now(timezone.utc)
@@ -1043,6 +1123,16 @@ def verify_approval_receipt(
     delegated_to = None
     delegated_quorum = None
     if delegation is not None:
+        if delegation.get("tenantId") != tenant_id:
+            return {
+                "ok": False,
+                "reason": "delegation and approval belong to different tenants or DIV versions",
+            }
+        if not isinstance(requester, dict) or requester.get("did") != delegation.get("requesterDid"):
+            return {
+                "ok": False,
+                "reason": "offline approval was requested by a different principal than the delegation",
+            }
         delegation_expiry = _parse_rfc3339(delegation.get("expiresAt"))
         if delegation_expiry is None:
             return {"ok": False, "reason": "delegation expiresAt is not a valid RFC3339 timestamp"}
@@ -1082,6 +1172,7 @@ def verify_approval_receipt(
             nonce=nonce,
             challenged_at=challenged_at,
             expires_at=expires_at,
+            **_tenant_builder_kwargs(tenant_id),
         )
     else:
         recomputed = canonical_intent_payload(
@@ -1094,6 +1185,7 @@ def verify_approval_receipt(
             nonce=nonce,
             expires_at=expires_at,
             agent_context=agent_context if agent_intent else None,
+            **_tenant_builder_kwargs(tenant_id),
         )
     if recomputed != canonical_payload:
         return {"ok": False, "reason": "target/params/actionType do not match what was approved"}
@@ -1225,6 +1317,7 @@ def verify_delegation(
     expected_rp_id: str = None,
     require_user_verification: bool = True,
     allow_cross_origin: bool = False,
+    expected_tenant_id: str = None,
 ) -> Dict[str, Any]:
     """Verify a DELEGATION (docs/DIV.md §5a.6 step 1).
 
@@ -1247,8 +1340,9 @@ def verify_delegation(
         return {"ok": False, "reason": "malformed canonicalPayload"}
     if not isinstance(payload_data, dict):
         return {"ok": False, "reason": "malformed canonicalPayload"}
-    if payload_data.get("v") != DIV_VERSION:
-        return {"ok": False, "reason": "unsupported DIV payload version"}
+    tenant_id, tenant_problem = _verify_tenant_binding(payload_data, expected, expected_tenant_id)
+    if tenant_problem:
+        return {"ok": False, "reason": tenant_problem}
     if payload_data.get("type") != DIV_DELEGATION_TYPE:
         return {"ok": False, "reason": "payload is not a div-delegation"}
 
@@ -1313,6 +1407,9 @@ def verify_delegation(
     requester = receipt.get("requester")
     if not requester:
         return {"ok": False, "reason": "delegation missing requester"}
+    expected_requester_did = expected.get("requesterDid")
+    if expected_requester_did is not None and requester.get("did") != expected_requester_did:
+        return {"ok": False, "reason": "approval was requested by a different principal"}
     requirement = payload_data.get("requirement")
     if not isinstance(requirement, dict) or not isinstance(requirement.get("requiredApprovals"), int):
         return {"ok": False, "reason": "delegation payload is missing the signed approval requirement"}
@@ -1355,6 +1452,7 @@ def verify_delegation(
         nonce=nonce,
         sealed_at=sealed_at,
         expires_at=expires_at,
+        **_tenant_builder_kwargs(tenant_id),
     )
     if recomputed != canonical_payload:
         return {"ok": False, "reason": "target/params/actionType do not match what was delegated"}
@@ -1440,9 +1538,7 @@ def verify_delegation(
                       f"approver signatures verified{detail}",
         }
 
-    return {
-        "ok": True,
-        "delegation": {
+    verified_delegation = {
             # The DEDUPLICATED set: this is what gets enforced against witness DIDs later, and a
             # duplicate entry must not create the illusion of a larger eligible pool.
             "delegatedTo": distinct,
@@ -1453,7 +1549,13 @@ def verify_delegation(
             "nonce": nonce,
             "signers": sorted(verified_signers),
             "expiresAt": expires_at,
-        },
+            "requesterDid": requester.get("did"),
+        }
+    if tenant_id is not None:
+        verified_delegation["tenantId"] = tenant_id
+    return {
+        "ok": True,
+        "delegation": verified_delegation,
     }
 
 def _witnesses_of(receipt: Dict[str, Any]) -> list:
@@ -1536,14 +1638,25 @@ def _shared_key_problem(counted: Dict[bytes, str], key: str, identity: str) -> O
 
     An identity-associating anchor that maps the SAME key to two DIDs would otherwise let that key's
     holder count as two approvers, since quorum counts distinct identities. A key already counted for
-    one identity cannot count for another. Keys compare by decoded bytes (padding and base64/base64url
-    spellings of one encoding match; the same key in another encoding, COSE vs SPKI, is not detected).
-    Records the key when it is free.
+    one identity cannot count for another. P-256 keys compare by public point, so COSE and SPKI
+    encodings of one credential match. Other encodings compare by decoded bytes.
     """
     try:
-        fingerprint = base64_decode_flexible(key)
+        decoded = base64_decode_flexible(key)
+        fingerprint = decoded
+        if decoded[:1] == b"\x30":
+            public_key = serialization.load_der_public_key(decoded)
+            if isinstance(public_key, ec.EllipticCurvePublicKey) and isinstance(public_key.curve, ec.SECP256R1):
+                numbers = public_key.public_numbers()
+                fingerprint = b"p256:" + numbers.x.to_bytes(32, "big") + numbers.y.to_bytes(32, "big")
+        else:
+            x_bytes, y_bytes = parse_cose_public_key(decoded)
+            fingerprint = b"p256:" + x_bytes + y_bytes
     except Exception:
-        fingerprint = key.encode("utf-8", "surrogatepass")
+        try:
+            fingerprint = base64_decode_flexible(key)
+        except Exception:
+            fingerprint = key.encode("utf-8", "surrogatepass")
     owner = counted.get(fingerprint)
     if owner is not None and owner != identity:
         return (
@@ -1707,6 +1820,7 @@ def verify_platform_receipt(receipt: Dict[str, Any], expected: Dict[str, Any], *
     expected_origin=None, expected_rp_id=None, require_user_verification: bool = True,
     allow_cross_origin: bool = False, allow_expired: bool = False, as_of=None,
     clock_skew_seconds: float = DEFAULT_CLOCK_SKEW_SECONDS,
+    expected_tenant_id: str = None,
 ) -> Dict[str, Any]:
     """Verify a §5c WebAuthn receipt against YOUR digest, RP, nonce and subject trust anchor.
 
@@ -1714,8 +1828,11 @@ def verify_platform_receipt(receipt: Dict[str, Any], expected: Dict[str, Any], *
     No auto-approval override exists for this receipt family.
     """
     payload = json.loads(receipt.get("canonicalPayload", ""))
-    if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload["v"] != DIV_VERSION:
+    if not isinstance(payload, dict):
         return {"ok": False, "reason": "unsupported DIV payload version"}
+    tenant_id, tenant_problem = _verify_tenant_binding(payload, expected, expected_tenant_id)
+    if tenant_problem:
+        return {"ok": False, "reason": tenant_problem}
     if payload.get("type") != DIV_PLATFORM_INTENT_TYPE:
         return {"ok": False, "reason": "payload is not a div-platform-intent"}
     nonce = expected.get("nonce")
@@ -1741,7 +1858,9 @@ def verify_platform_receipt(receipt: Dict[str, Any], expected: Dict[str, Any], *
     signed, expiry = _parse_rfc3339(signed_at), _parse_rfc3339(expires_at)
     if signed is None or expiry is None:
         return {"ok": False, "reason": "signedAt/expiresAt is not a valid RFC3339 timestamp"}
-    recomputed = canonical_platform_intent_payload(digest, rp_id, external_id, signed_at, expires_at, nonce)
+    recomputed = canonical_platform_intent_payload(
+        digest, rp_id, external_id, signed_at, expires_at, nonce, **_tenant_builder_kwargs(tenant_id)
+    )
     if recomputed != receipt["canonicalPayload"]:
         return {"ok": False, "reason": "payloadHash/rpId do not match what was signed"}
     now = as_of or datetime.now(timezone.utc)
@@ -1768,11 +1887,15 @@ def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
     expected_origin=None, expected_rp_id=None, require_user_verification: bool = True,
     allow_cross_origin: bool = False, allow_expired: bool = False, as_of=None,
     clock_skew_seconds: float = DEFAULT_CLOCK_SKEW_SECONDS,
+    expected_tenant_id: str = None,
 ) -> Dict[str, Any]:
     """Verify §5b governance evidence. This never approves execution or proves non-revocation."""
     payload = json.loads(receipt.get("canonicalPayload", ""))
-    if not isinstance(payload, dict) or type(payload.get("v")) is not int or payload["v"] != DIV_VERSION:
+    if not isinstance(payload, dict):
         return {"ok": False, "reason": "unsupported DIV payload version"}
+    tenant_id, tenant_problem = _verify_tenant_binding(payload, expected, expected_tenant_id)
+    if tenant_problem:
+        return {"ok": False, "reason": tenant_problem}
     if payload.get("type") != DIV_AGENT_AUTHORITY_TYPE:
         return {"ok": False, "reason": "payload is not a div-agent-authority"}
     patterns = payload.get("actionPatterns")
@@ -1808,7 +1931,8 @@ def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
     if sealed.timestamp() > now.timestamp() + clock_skew_seconds:
         return {"ok": False, "reason": "authority is sealed in the future"}
     recomputed = canonical_agent_authority_payload(target, patterns, receipt.get("actionDescription", ""),
-        {"did": agent_did}, requester, requirement, nonce, sealed_at, expires_at, parent)
+        {"did": agent_did}, requester, requirement, nonce, sealed_at, expires_at, parent,
+        **_tenant_builder_kwargs(tenant_id))
     if recomputed != receipt["canonicalPayload"]:
         return {"ok": False, "reason": "target/agent/actionPatterns do not match what was sealed"}
     if not allow_expired and now.timestamp() > expiry.timestamp() + clock_skew_seconds:
@@ -1820,12 +1944,94 @@ def verify_agent_authority(receipt: Dict[str, Any], expected: Dict[str, Any], *,
         require_user_verification=require_user_verification, allow_cross_origin=allow_cross_origin)
     if len(signers) < requirement["requiredApprovals"]:
         return {"ok": False, "reason": "authority sealing quorum not met: " + "; ".join(failures)}
-    return {"ok": True, "authority": {
+    authority = {
         "agentDid": agent_did, "target": target,
         "actionPatterns": sorted(set(patterns), key=lambda p: p.encode("utf-16-be")),
         "parentReceiptHash": parent,
         "nonce": nonce, "signers": sorted(signers), "sealedAt": sealed_at, "expiresAt": expires_at,
-    }}
+    }
+    if tenant_id is not None:
+        authority["tenantId"] = tenant_id
+    return {"ok": True, "authority": authority}
+
+
+def agent_receipt_digest(receipt: Dict[str, Any]) -> str:
+    """Commit to the complete authority proof, including every witness in canonical order."""
+    witnesses = []
+    for witness in _witnesses_of(receipt):
+        witnesses.append({
+            "signerDid": witness.get("signerDid"),
+            "signerPublicKey": witness.get("signerPublicKey"),
+            "signature": witness.get("signature"),
+            "sigAlg": witness.get("sigAlg"),
+            "authenticatorData": witness.get("authenticatorData"),
+            "clientDataJSON": witness.get("clientDataJSON"),
+        })
+    witnesses.sort(key=stable_stringify)
+    content = stable_stringify({"canonicalPayload": receipt.get("canonicalPayload"), "witnesses": witnesses})
+    digest = hashlib.sha256(b"intyga-agent-receipt-v1\0" + content.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+@_never_raises
+def verify_agent_delegation_chain(
+    chain: list,
+    action: Dict[str, Any],
+    *,
+    expected_origin=None,
+    expected_rp_id=None,
+    require_user_verification: bool = True,
+    allow_cross_origin: bool = False,
+    allow_expired: bool = False,
+    as_of=None,
+    clock_skew_seconds: float = DEFAULT_CLOCK_SKEW_SECONDS,
+) -> Dict[str, Any]:
+    """Verify a complete root-to-leaf human-sealed authority chain and its tenant continuity."""
+    if not isinstance(chain, list) or len(chain) < 2 or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", action.get("delegatedBy", "")
+    ):
+        return {"ok": False, "reason": "delegation requires a complete root-to-leaf authority chain"}
+    parent = None
+    parent_hash = None
+    for index, link in enumerate(chain):
+        if not isinstance(link, dict):
+            return {"ok": False, "reason": "authority chain has a missing link"}
+        proof = verify_agent_authority(
+            link.get("receipt"), link.get("expected"),
+            expected_origin=expected_origin, expected_rp_id=expected_rp_id,
+            require_user_verification=require_user_verification,
+            allow_cross_origin=allow_cross_origin, allow_expired=allow_expired,
+            as_of=as_of, clock_skew_seconds=clock_skew_seconds,
+        )
+        authority = proof.get("authority") if proof.get("ok") else None
+        if authority is None:
+            return {"ok": False, "reason": f"authority link {index + 1}: {proof.get('reason')}"}
+        if authority.get("tenantId") != action.get("tenantId"):
+            return {"ok": False, "reason": "authority chain and action belong to different tenants"}
+        if authority.get("target") != action.get("target"):
+            return {"ok": False, "reason": "delegated authority changes target"}
+        if authority.get("parentReceiptHash") != parent_hash:
+            return {"ok": False, "reason": "delegated authority has a missing or different parent receipt"}
+        if parent is not None:
+            if authority.get("tenantId") != parent.get("tenantId"):
+                return {"ok": False, "reason": "authority chain crosses tenant boundaries"}
+            if (
+                _parse_rfc3339(authority.get("sealedAt")) < _parse_rfc3339(parent.get("sealedAt"))
+                or _parse_rfc3339(authority.get("expiresAt")) > _parse_rfc3339(parent.get("expiresAt"))
+            ):
+                return {"ok": False, "reason": "child authority outlives or predates its parent"}
+            parent_patterns = [p.lower() for p in parent.get("actionPatterns", [])]
+            for child in authority.get("actionPatterns", []):
+                if not any(scope == "*" or scope in child.lower() for scope in parent_patterns):
+                    return {"ok": False, "reason": "child authority escalates the parent's action scope"}
+        parent = authority
+        parent_hash = agent_receipt_digest(link["receipt"])
+    if parent_hash != action.get("delegatedBy") or parent.get("agentDid") != action.get("agentDid"):
+        return {"ok": False, "reason": "action does not name its delegated agent and leaf authority receipt"}
+    action_type = str(action.get("actionType", "")).lower()
+    if not any(p == "*" or p.lower() in action_type for p in parent.get("actionPatterns", [])):
+        return {"ok": False, "reason": "action falls outside the delegated authority"}
+    return {"ok": True}
 
 
 # ── Policy Crypto Namespace ───────────────────────────────────────────────────

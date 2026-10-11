@@ -171,6 +171,14 @@ def verify_trust_bundle(
         return _refuse("invalid trust bundle payload")
     if bundle.get("type") != DIV_TRUST_BUNDLE_TYPE or not _is_version_one(bundle.get("v")):
         return _refuse("unsupported trust bundle type or version")
+    if not isinstance(bundle.get("tenantId"), str) or bundle["tenantId"] == "":
+        return _refuse("trust bundle tenantId must be a non-empty string")
+    if "webauthn" in bundle:
+        pins = bundle["webauthn"]
+        if not isinstance(pins, dict) or not all(
+            isinstance(pins.get(k), str) and pins[k] for k in ("origin", "rpId")
+        ):
+            return _refuse("invalid trust bundle WebAuthn expectations")
     unmatched = bundle.get("unmatchedActionPolicy")
     if unmatched not in ("DENY", "BASELINE"):
         return _refuse("trust bundle has no valid unmatched-action decision")
@@ -282,11 +290,14 @@ def approver_anchor(
 
     ``purpose`` is ``"ordinary"`` (the default: ``publicKeys`` only — what a delegation or an ordinary
     intent is verified against) or ``"offline-intent"`` (adds ``offlinePublicKeys``; ONLY for verifying a
-    ``div-offline-intent``). A bare offline key that could seal a delegation would hand its holder the
-    approval authority the delegation transfers (DIV §5a.4). Any other value raises ``ValueError``.
+    ``div-offline-intent``). Offline intent also requires an explicit DID restriction; omission raises
+    ``ValueError`` so the whole tenant bundle cannot broaden an action's eligible approver set. Any
+    other purpose raises ``ValueError``.
     """
     if purpose not in ("ordinary", "offline-intent"):
         raise ValueError(f'purpose must be "ordinary" or "offline-intent", got {purpose!r}')
+    if purpose == "offline-intent" and limit_to_dids is None:
+        raise ValueError("offline-intent anchors require an explicit eligible DID restriction")
     by_did: Dict[str, List[str]] = {}
     for a in bundle.get("approvers") or []:
         if limit_to_dids is not None and a.get("did") not in limit_to_dids:
@@ -350,4 +361,3 @@ def requirement_for(
         },
         "approverDids": list(winner["approverDids"]),
     }
-

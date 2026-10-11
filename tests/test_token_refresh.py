@@ -96,6 +96,48 @@ class TestExchangeAndCache(unittest.TestCase):
                 asyncio.run(exchanging_client().token())
         self.assertEqual(ctx.exception.status, 401)
 
+    def test_explicit_client_credentials_take_precedence_over_a_saved_login(self):
+        saved = fake_jwt({"sub": "did:key:personal", "exp": int(time.time()) + 600})
+        gw = FakeGateway()
+        client = exchanging_client(allow_stored_credentials=True)
+        with mock.patch.object(client_mod, "_load_stored_token", return_value=saved) as load, mock.patch.object(
+            client_mod, "_async_request", gw
+        ):
+            self.assertEqual(asyncio.run(client.token()), "t1")
+        load.assert_not_called()
+        self.assertEqual(gw.exchanges, 1)
+        self.assertEqual(client._cached_source, "exchange")
+
+    def test_rejected_explicit_exchange_never_falls_back_to_a_saved_login(self):
+        saved = fake_jwt({"sub": "did:key:personal", "exp": int(time.time()) + 600})
+
+        async def reject(_url, method="GET", headers=None, json_body=None):
+            return (401, json.dumps({"error": "invalid_client"}))
+
+        client = exchanging_client(allow_stored_credentials=True)
+        with mock.patch.object(client_mod, "_load_stored_token", return_value=saved) as load, mock.patch.object(
+            client_mod, "_async_request", reject
+        ):
+            with self.assertRaises(GatewayRefused) as ctx:
+                asyncio.run(client.token())
+        load.assert_not_called()
+        self.assertEqual(ctx.exception.status, 401)
+
+    def test_incomplete_explicit_credentials_never_fall_back_to_a_saved_login(self):
+        saved = fake_jwt({"sub": "did:key:personal", "exp": int(time.time()) + 600})
+        for supplied in ({"client_id": "cid"}, {"client_secret": "sec"}):
+            with self.subTest(supplied=supplied):
+                client = IntygaClient(
+                    gateway_url=GW,
+                    target="rp-1",
+                    allow_stored_credentials=True,
+                    **supplied,
+                )
+                with mock.patch.object(client_mod, "_load_stored_token", return_value=saved) as load:
+                    with self.assertRaises(ValueError):
+                        asyncio.run(client.token())
+                load.assert_not_called()
+
     def test_re_exchanges_once_the_clock_passes_expires_in_minus_margin(self):
         # expires_in 900 → margin min(60, 90) = 60 → fresh strictly before 840 s.
         gw = FakeGateway(expires_in=900)
@@ -250,10 +292,20 @@ class TestUnauthorizedRetry(unittest.TestCase):
 
     def test_explicit_token_is_never_re_exchanged(self):
         gw = FakeGateway(expires_in=900, authed_responses=[(401, "{}")])
-        client = IntygaClient(gateway_url=GW, token="explicit", client_id="cid", client_secret="sec", target="rp-1")
-        with mock.patch.object(client_mod, "_async_request", gw):
+        client = IntygaClient(
+            gateway_url=GW,
+            token="explicit",
+            client_id="cid",
+            client_secret="sec",
+            target="rp-1",
+            allow_stored_credentials=True,
+        )
+        with mock.patch.object(client_mod, "_load_stored_token") as load, mock.patch.object(
+            client_mod, "_async_request", gw
+        ):
             with self.assertRaises(GatewayRefused) as ctx:
                 asyncio.run(client.authorize("do it", action_type="t"))
+        load.assert_not_called()
         self.assertEqual(ctx.exception.status, 401)
         self.assertEqual(gw.exchanges, 0)
         self.assertEqual(gw.bearers("/authorize"), ["Bearer explicit"])
@@ -320,7 +372,8 @@ class TestStoredCredential(unittest.TestCase):
         # credentials on a box where someone ran `intyga login` mid-session would retry an AGENT call
         # as the HUMAN — a different principal and a different requester on the witness leaf.
         live = fake_jwt({"sub": "did:key:human", "exp": int(time.time()) + 600})
-        on_disk = {"token": None}
+        on_disk = {"token": live}
+        loads = []
         gw = FakeGateway(
             expires_in=900,
             authed_responses=[
@@ -333,12 +386,17 @@ class TestStoredCredential(unittest.TestCase):
         async def gateway(url, method="GET", headers=None, json_body=None):
             status, body = await real_gw(url, method=method, headers=headers, json_body=json_body)
             if status == 401:
-                # A concurrent `intyga login` lands exactly between the first exchange and its 401.
+                # The saved principal can change while the request is running too; neither value
+                # may affect the explicitly selected service credentials.
                 on_disk["token"] = live
             return status, body
 
+        def load(_gateway_url):
+            loads.append(1)
+            return on_disk["token"]
+
         client = exchanging_client(allow_stored_credentials=True)
-        with mock.patch.object(client_mod, "_load_stored_token", lambda _gw: on_disk["token"]), mock.patch.object(
+        with mock.patch.object(client_mod, "_load_stored_token", load), mock.patch.object(
             client_mod, "_async_request", gateway
         ):
             r = asyncio.run(client.authorize("do it", action_type="t"))
@@ -346,6 +404,7 @@ class TestStoredCredential(unittest.TestCase):
         self.assertEqual(gw.exchanges, 2, "the retry must be a client-credentials exchange")
         self.assertEqual(gw.bearers("/authorize"), ["Bearer t1", "Bearer t2"])
         self.assertNotIn(f"Bearer {live}", gw.bearers("/authorize"), "the stored human token must never be sent")
+        self.assertEqual(loads, [], "the selected client credentials bypass stored-login lookup on refresh too")
 
     def test_stored_credential_without_a_readable_exp_is_still_used(self):
         opaque = "not-a-jwt"

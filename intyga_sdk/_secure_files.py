@@ -62,16 +62,29 @@ def write_private_file(path: str, contents: Union[str, bytes]) -> None:
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _EXTRA, PRIVATE_FILE_MODE)
         try:
             _write_all(fd, data)
+            os.fsync(fd)
         finally:
             os.close(fd)
         _repair_mode(temp, PRIVATE_FILE_MODE)
         os.replace(temp, path)
         _repair_mode(path, PRIVATE_FILE_MODE)
+        _sync_directory(directory)
     finally:
         try:
             os.unlink(temp)
         except OSError:
             pass
+
+
+def _sync_directory(directory: str) -> None:
+    if os.name == "nt":  # Windows does not expose directory fsync.
+        return
+    for entry in (directory, os.path.dirname(os.path.abspath(directory))):
+        fd = os.open(entry, os.O_RDONLY | _EXTRA)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def create_private_marker(path: str, contents: str) -> bool:
@@ -89,6 +102,8 @@ def create_private_marker(path: str, contents: str) -> bool:
         _write_all(fd, contents.encode("utf-8"))
         if hasattr(os, "fchmod"):
             os.fchmod(fd, PRIVATE_FILE_MODE)
+        os.fsync(fd)
+        _sync_directory(os.path.dirname(path) or ".")
     except OSError:
         return False
     finally:

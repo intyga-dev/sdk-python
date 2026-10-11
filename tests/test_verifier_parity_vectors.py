@@ -87,9 +87,16 @@ def _run_approval_cases(section, keys):
         raw = {**section["expected"], **case.get("expected", {})}
         # A WEBAUTHN witness verifies under the credential's COSE_Key; such cases say so explicitly.
         encoding = "coseB64" if case.get("approverKeyEncoding") == "cose" else "spkiB64"
-        expected = {**raw, "approvers": {
-            "publicKeys": [keys[key_id][encoding] for key_id in raw["approverKeyIds"]]
-        }}
+        if "approverDids" in raw:
+            cose_dids = set(raw.get("approverCoseDids", []))
+            resolved = {
+                did: [keys[key_id]["coseB64" if did in cose_dids else "spkiB64"] for key_id in ids]
+                for did, ids in raw["approverDids"].items()
+            }
+            approvers = {"dids": list(resolved), "resolveKey": lambda did: resolved.get(did)}
+        else:
+            approvers = {"publicKeys": [keys[key_id][encoding] for key_id in raw["approverKeyIds"]]}
+        expected = {**raw, "approvers": approvers}
         options = {**section["options"], **case.get("options", {})}
         result = intyga_sdk.verify_approval_receipt(
             case["receipt"], expected, as_of=_at(options["asOf"]),

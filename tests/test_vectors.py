@@ -525,11 +525,13 @@ class TestTrustAnchor(unittest.TestCase):
         expected = {
             "target": payload["target"], "actionType": payload["actionType"],
             "params": payload["params"], "nonce": payload["nonce"],
+            "requesterDid": payload["requester"]["did"],
             "approvers": {"dids": [signer_did], "resolveKey": lambda did: receipt["signerPublicKey"]},
         }
         delegation = {
             "target": payload["target"], "actionType": payload["actionType"], "params": payload["params"],
-            "delegatedTo": [signer_did], "delegatedQuorum": 1, "expiresAt": "2998-12-31T23:59:00Z",
+            "requesterDid": payload["requester"]["did"], "delegatedTo": [signer_did],
+            "delegatedQuorum": 1, "expiresAt": "2998-12-31T23:59:00Z",
         }
         verify = lambda at, **kw: intyga_sdk.verify_approval_receipt(
             receipt, expected, allow_offline=True, delegation=delegation,

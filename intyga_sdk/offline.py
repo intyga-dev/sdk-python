@@ -65,6 +65,8 @@ from ._jsutil import (
 )
 from ._secure_files import create_private_marker, ensure_private_dir, write_private_file
 from .crypto import (
+    DIV_TENANT_BOUND_VERSION,
+    DIV_VERSION,
     DIV_OFFLINE_INTENT_TYPE,
     MAX_OFFLINE_WINDOW_MINUTES,
     NonCanonicalValue,
@@ -147,6 +149,9 @@ def create_offline_challenge(
     ``delegation`` is one already verified by :func:`intyga_sdk.verify_delegation`: under it the signed
     quorum becomes ``delegatedQuorum`` and the eligible set ``delegatedTo``.
     """
+    tenant_id = bundle.get("tenantId")
+    if not isinstance(tenant_id, str) or tenant_id == "":
+        return _refuse("the verified trust bundle is missing its required tenantId")
     # DIV §3 Invariant 5 (Target Isolation): a blank target binds no execution environment, so the
     # approval would verify at every relying party that also asserts it.
     if not isinstance(target, str) or not js_trim(target):
@@ -193,6 +198,8 @@ def create_offline_challenge(
                 f'this delegation would lower the quorum for "{action_type}" from {rule_quorum} to '
                 f"{delegated_quorum}. A delegation may narrow WHO approves, never HOW MANY (DIV §5a.5)"
             )
+        if delegation.get("tenantId") != tenant_id:
+            return _refuse("the delegation and trust bundle belong to different tenants or DIV versions")
         # Under a delegation the eligible set and the quorum are the DELEGATED ones. Everything else in
         # the requirement still comes from the bundle.
         requirement = {**resolved["requirement"], "requiredApprovals": delegated_quorum}
@@ -214,6 +221,7 @@ def create_offline_challenge(
             nonce=nonce,
             challenged_at=challenged_at,
             expires_at=expires_at,
+            tenant_id=tenant_id,
         )
     except (NonCanonicalValue, RecursionError) as exc:
         return _refuse(f"the action cannot be canonicalized: {exc}")
@@ -221,6 +229,7 @@ def create_offline_challenge(
     return {
         "ok": True,
         "challenge": {
+            "tenantId": tenant_id,
             "nonce": nonce,
             "canonicalPayload": canonical,
             "verificationCode": verification_code(canonical),
@@ -294,6 +303,7 @@ def decode_challenge_envelope(envelope: str) -> Dict[str, Any]:
             nonce=parsed.get("nonce"),
             challenged_at=parsed.get("challengedAt"),
             expires_at=parsed.get("expiresAt"),
+            **({"tenant_id": parsed["tenantId"]} if parsed.get("v") == DIV_TENANT_BOUND_VERSION else {}),
         )
     except Exception:  # noqa: BLE001 - a missing or mistyped field is the same refusal
         return _refuse("challenge payload carries values that cannot be canonicalized — refusing to sign it")
@@ -305,6 +315,7 @@ def decode_challenge_envelope(envelope: str) -> Dict[str, Any]:
     return {
         "ok": True,
         "challenge": {
+            **({"tenantId": parsed["tenantId"]} if parsed.get("v") == DIV_TENANT_BOUND_VERSION else {}),
             "canonicalPayload": canonical,
             "verificationCode": verification_code(canonical),
             "target": parsed.get("target"),
@@ -325,6 +336,15 @@ def _challenge_shape_problem(p: Dict[str, Any]) -> Optional[str]:
     The same shapes every SDK refuses (docs/OFFLINE-APPROVAL-SDK.md, "Envelopes"). ``json.loads``
     yields exactly ``str`` for a JSON string and ``dict`` for an object, so these checks cannot be
     satisfied by a number, a bool, a list or null."""
+    version = p.get("v")
+    if type(version) is not int or version not in (DIV_VERSION, DIV_TENANT_BOUND_VERSION):
+        return "has an unsupported DIV payload version"
+    if version == DIV_VERSION and "tenantId" in p:
+        return "is a legacy v1 payload carrying tenantId"
+    if version == DIV_TENANT_BOUND_VERSION and (
+        not isinstance(p.get("tenantId"), str) or p["tenantId"] == ""
+    ):
+        return "is a v2 payload without a non-empty tenantId"
     for field in ("target", "actionType", "display", "nonce", "challengedAt", "expiresAt"):
         if not isinstance(p.get(field), str):
             return f"field {field} is not a string"
@@ -420,12 +440,13 @@ def sign_challenge_envelope(
 
     Returns ``{"ok": True, "envelope": "SIG1:…", "challenge": {...decoded...}}`` or a refusal.
 
-    Decodes first (so only a canonical ``div-offline-intent`` is ever signed) and refuses a challenge
-    whose ``expiresAt`` is unreadable or already past, a ``signer_did`` that is not a DID, and any key
-    that is not a P-256 private key. ``private_key`` is the approver's offline signing key: an
-    ``EllipticCurvePrivateKey``, a PEM string/bytes, or DER PKCS#8 bytes. The signature is ES256 over
-    the canonical payload's UTF-8 bytes in IEEE P1363 (r‖s) form, and the envelope's ``key`` is the
-    signer's base64 SPKI. A PEM may be PKCS#8 (``PRIVATE KEY``) or SEC1 (``EC PRIVATE KEY``, what
+    Decodes first (so only a canonical ``div-offline-intent`` is ever signed) and refuses archival
+    DIV v1 challenges, a challenge whose ``expiresAt`` is unreadable or already past, a ``signer_did``
+    that is not a DID, and any key that is not a P-256 private key. ``private_key`` is the approver's
+    offline signing key: an ``EllipticCurvePrivateKey``, a PEM string/bytes, or DER PKCS#8 bytes. The
+    signature is ES256 over the canonical payload's UTF-8 bytes in IEEE P1363 (r‖s) form, and the
+    envelope's ``key`` is the signer's base64 SPKI. A PEM may be PKCS#8 (``PRIVATE KEY``) or SEC1
+    (``EC PRIVATE KEY``, what
     ``openssl ecparam -genkey`` writes).
 
     It shows nothing. The caller MUST have shown the decoded challenge to the approver and had them
@@ -436,6 +457,10 @@ def sign_challenge_envelope(
     if not decoded["ok"]:
         return _refuse(decoded["reason"])
     challenge = decoded["challenge"]
+    # Keep v1 decoding for historical inspection, while refusing to create any new approval that
+    # is not bound to an independently trusted tenant.
+    if "tenantId" not in challenge:
+        return _refuse("legacy DIV v1 offline challenges are archival-only and cannot be freshly signed")
     # A timestamp we cannot read is not one we can say is still valid (DIV §6.2).
     expiry = timestamp_ms(challenge["expiresAt"])
     if expiry is None:
@@ -633,7 +658,9 @@ async def use_offline_approval(
     # ORDINARY approver set — those entitled to approve are the ones who must have delegated.
     delegation = None
     if opts.delegation_dir is not None:
-        found = _find_delegation(os.fspath(opts.delegation_dir), bundle, expected, opts.as_of)
+        found = _find_delegation(
+            os.fspath(opts.delegation_dir), bundle, expected, opts.requester_did, opts.as_of
+        )
         if found.get("reason"):
             warn(f"⚠ OFFLINE APPROVAL: {found['reason']}")
         delegation = found.get("delegation")
@@ -686,10 +713,12 @@ async def use_offline_approval(
     result = verify_approval_receipt(
         receipt,
         {
+            "tenantId": bundle["tenantId"],
             "target": expected["target"],
             "actionType": expected["actionType"],
             "params": expected["params"],
             "nonce": challenge["nonce"],
+            "requesterDid": opts.requester_did,
             # Only the approvers eligible for THIS action, so a valid signature from outside the rule's
             # list does not count. The one place offline signing keys count: this is a div-offline-intent.
             "approvers": approver_anchor(bundle, challenge["approverDids"], "offline-intent"),
@@ -710,7 +739,10 @@ async def use_offline_approval(
     # Buffer BEFORE redeeming: a crash between the two must leave a pending record behind. A spurious
     # record reconciles harmlessly; the opposite order could leave a redeemed, executed approval
     # invisible to reconciliation forever.
-    _buffer_for_reconciliation(challenge, receipt, delegation, opts, bundle_dir, warn)
+    try:
+        _buffer_for_reconciliation(challenge, receipt, delegation, opts, bundle_dir)
+    except Exception:  # noqa: BLE001 - refuse before redemption
+        return _refuse("could not buffer offline approval for reconciliation")
     if not store.redeem(challenge["nonce"]):
         clear_pending_approval(challenge["nonce"], bundle_dir, opts.buffer_dir)
         return _refuse(f"nonce {challenge['nonce']} has already been redeemed here")
@@ -737,6 +769,7 @@ def _find_delegation(
     directory: str,
     bundle: Mapping[str, Any],
     expected: Mapping[str, Any],
+    requester_did: str,
     as_of: Optional[datetime],
 ) -> Dict[str, Any]:
     """Find and verify a delegation covering this exact action. A file that fails to verify is
@@ -758,12 +791,16 @@ def _find_delegation(
         try:
             with open(os.path.join(directory, name), "r", encoding="utf-8") as f:
                 receipt = json_loads(f.read())
+            if isinstance(receipt, dict) and "receipt" in receipt:
+                receipt = receipt["receipt"]
         except Exception:  # noqa: BLE001
             rejected.append(f"{name}: unreadable")
             continue
         res = verify_delegation(
             receipt,
             {
+                "tenantId": bundle["tenantId"],
+                "requesterDid": requester_did,
                 # The ORDINARY approver set — whoever may approve this action is who must have
                 # delegated it. Ordinary keys only: an offline signing key must never seal a delegation.
                 "approvers": approver_anchor(bundle, resolved["approverDids"], "ordinary"),
@@ -775,6 +812,8 @@ def _find_delegation(
                 "requirement": _requirement_floor(ordinary),
             },
             as_of=as_of,
+            expected_origin=bundle.get("webauthn", {}).get("origin"),
+            expected_rp_id=bundle.get("webauthn", {}).get("rpId"),
         )
         if not res.get("ok") or not res.get("delegation"):
             rejected.append(f"{name}: {res.get('reason')}")
@@ -816,14 +855,8 @@ def _buffer_for_reconciliation(
     delegation: Optional[Mapping[str, Any]],
     opts: OfflineApprovalOptions,
     bundle_dir: str,
-    warn: Warn,
 ) -> None:
-    """Record the approval so it can be reported when the gateway is reachable again.
-
-    Best effort by design: a buffering failure must never block the emergency action the operator is
-    mid-incident on. It is warned about loudly instead, because an unrecorded approval is exactly the
-    case reconciliation exists to surface.
-    """
+    """Record the approval; a write failure propagates before redemption."""
     nonce = challenge["nonce"]
     record: Dict[str, Any] = {
         "nonce": nonce,
@@ -835,17 +868,11 @@ def _buffer_for_reconciliation(
     }
     if delegation is not None and delegation.get("nonce") is not None:
         record["delegationNonce"] = delegation["nonce"]
-    try:
-        if not _is_path_safe_nonce(nonce):
-            raise ValueError("nonce is not a safe path segment")
-        directory = _buffer_dir(bundle_dir, opts.buffer_dir)
-        ensure_private_dir(directory)
-        write_private_file(os.path.join(directory, f"{nonce}.json"), json_dumps(record, indent=2) + "\n")
-    except Exception as exc:  # noqa: BLE001 - best effort, but never silent
-        warn(
-            f"⚠ OFFLINE APPROVAL: could not buffer {nonce} for reconciliation ({exc}). Report this "
-            "manually — an unreported approval is indistinguishable from an unauthorized one."
-        )
+    if not _is_path_safe_nonce(nonce):
+        raise ValueError("nonce is not a safe path segment")
+    directory = _buffer_dir(bundle_dir, opts.buffer_dir)
+    ensure_private_dir(directory)
+    write_private_file(os.path.join(directory, f"{nonce}.json"), json_dumps(record, indent=2) + "\n")
 
 
 def read_pending_approvals(

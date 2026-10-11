@@ -209,7 +209,10 @@ class TestPendingRecords(BundleDirCase):
         check = verify_approval_receipt(
             rec["receipt"],
             {**{k: ACTION[k] for k in ("target", "actionType", "params")}, "nonce": rec["nonce"],
-             "approvers": approver_anchor(V["bundle"], None, "offline-intent")},
+             "tenantId": V["bundle"]["tenantId"],
+             "approvers": approver_anchor(
+                 V["bundle"], ["did:intyga:alice", "did:intyga:bob"], "offline-intent"
+             )},
             allow_offline=True,
             as_of=AS_OF,
         )
@@ -487,7 +490,10 @@ class TestFallbackGating(BundleDirCase):
         check = verify_approval_receipt(
             r["receipt"],
             {**{k: ACTION[k] for k in ("target", "actionType", "params")}, "nonce": r["nonce"],
-             "approvers": approver_anchor(V["bundle"], None, "offline-intent")},
+             "tenantId": V["bundle"]["tenantId"],
+             "approvers": approver_anchor(
+                 V["bundle"], ["did:intyga:alice", "did:intyga:bob"], "offline-intent"
+             )},
             allow_offline=True,
             as_of=AS_OF,
         )

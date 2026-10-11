@@ -66,6 +66,8 @@ async def delete_production_database(database: str):
         "params": params,
         "nonce": nonce,
         "approvers": APPROVERS,
+        # Independently configured tenant identity. DIV v2 refuses to infer this from the receipt.
+        "tenantId": os.environ["INTYGA_TENANT_ID"],
     },
         # REQUIRED for passkey receipts: pin the assertion to YOUR approval console
         # (the deployment's WEBAUTHN_ORIGIN / WEBAUTHN_RP_ID), or verification fails closed.
@@ -84,6 +86,9 @@ it automatically shortly before the `expires_in` the gateway advertised (and onc
 unexpected 401), so a long-lived service or a long poll never dies at token expiry. A stored
 `intyga login` credential cannot be refreshed: when it expires the SDK raises `GatewayRefused`
 telling you to run `intyga login` again.
+When `allow_stored_credentials=True`, the saved login is considered only if neither `client_id` nor
+`client_secret` was supplied. Supplying either field selects client credentials; incomplete or
+rejected credentials fail closed without changing the caller to the saved human login.
 
 `require_approval(timeout=600)` uses 600 seconds for both the gateway TTL and local approval wait;
 `timeout_ms`, when supplied, takes precedence. A monotonic deadline prevents accepting late results
@@ -118,7 +123,10 @@ intyga = IntygaClient(
 )
 APPROVERS = {"publicKeys": os.environ["INTYGA_APPROVER_KEYS"].split(",")}
 
-@require_human_approval(intyga, description="Send a wire transfer", approvers=APPROVERS)
+@require_human_approval(
+    intyga, description="Send a wire transfer", approvers=APPROVERS,
+    tenant_id=os.environ["INTYGA_TENANT_ID"],
+)
 def wire_transfer(*, to: str, amount: int, currency: str) -> str:
     """Send a wire transfer to a named counterparty."""
     return execute_transfer(to, amount, currency)
@@ -127,7 +135,8 @@ def wire_transfer(*, to: str, amount: int, currency: str) -> str:
 With `approvers`, the guard re-derives the canonical payload from the target it raised the
 challenge under and the kwargs it is about to execute, verifies the receipt's signatures against
 **your** keys, redeems the nonce (`consume`) so the approval is single-use, and only then calls the
-function. A result carrying no `receipt` is a refusal. Pass `expected_origin` and `expected_rp_id`
+function. A result carrying no `receipt` is a refusal. Pass `tenant_id` from your trust anchor or
+other independently trusted configuration; DIV v2 never infers it from the receipt. Pass `expected_origin` and `expected_rp_id`
 too — a WEBAUTHN witness is not countable without them (DIV §4.4.5, fail-closed when unset).
 The guard first validates and deep-copies the keyword arguments as canonical JSON; approval,
 verification, consumption and execution all use that detached snapshot, so another task cannot
@@ -155,7 +164,10 @@ transfer_tool = StructuredTool.from_function(wire_transfer)
 from crewai.tools import tool
 
 @tool("wire_transfer")
-@require_human_approval(intyga, action_type="wire_transfer", approvers=APPROVERS)
+@require_human_approval(
+    intyga, action_type="wire_transfer", approvers=APPROVERS,
+    tenant_id=os.environ["INTYGA_TENANT_ID"],
+)
 def wire_transfer(*, to: str, amount: int) -> str:
     """Send a wire transfer."""
     return execute_transfer(to, amount, "USD")
@@ -240,6 +252,9 @@ The building blocks are exported too: `verify_trust_bundle`, `save_trust_bundle`
 signer_did=...)` signs a `DIV1:` challenge with an offline P-256 key and returns the `SIG1:` reply. It
 displays nothing: show the decoded challenge and confirm the verification code with the operator
 first.
+
+For `purpose="offline-intent"`, `approver_anchor` requires the action's explicit eligible DID list
+and raises `ValueError` when it is omitted. Ordinary anchors may remain unrestricted.
 
 ## Verifying an approval receipt
 
